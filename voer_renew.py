@@ -125,6 +125,7 @@ class VoerRenewer:
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/126.0.0.0 Safari/537.36"),
+            proxy={"server": self.args.proxy} if self.args.proxy else None,
         )
         self.ctx = ctx
         self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -367,6 +368,9 @@ def parse_args():
     p.add_argument("--profile-dir", default=None)
     p.add_argument("--headless", action="store_true")
     p.add_argument("--timeout-min", default=10, help="单次续签最长等待分钟数")
+    p.add_argument("--proxy", default=None,
+                   help="代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
+                        "（Clash/v2ray 等本地代理常见端口）")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 

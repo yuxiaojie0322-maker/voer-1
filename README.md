@@ -40,6 +40,9 @@ python voer_renew.py run
 # 指定服务器
 python voer_renew.py run --server 我的服务器名
 
+# 挂代理（HK 节点等）：Clash/v2ray 本地端口示例 7890
+python voer_renew.py run --proxy http://127.0.0.1:7890
+
 # 只看状态（服务器列表、今日续签次数、剩余时间）
 python voer_renew.py status
 
