@@ -17,3 +17,5 @@ hk_tuic_singbox.json
 pl_hy2_singbox.json
 singbox.log
 singbox_hy2.log
+run_local.sh
+singbox_local.log
