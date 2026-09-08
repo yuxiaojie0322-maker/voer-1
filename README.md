@@ -43,6 +43,25 @@ python voer_renew.py run --server 我的服务器名
 # 挂代理（HK 节点等）：Clash/v2ray 本地端口示例 7890
 python voer_renew.py run --proxy http://127.0.0.1:7890
 
+# ─── 免 Turnstile 的三种会话方式（推荐任选其一）───
+
+# 方式1【最优】: 直连你已登录的真实 Chrome（复用它的 cookie/指纹）
+#   先以调试模式启动 Chrome：
+#   - Windows:  chrome.exe --remote-debugging-port=9222
+#   - macOS:    open -a "Google Chrome" --args --remote-debugging-port=9222
+#   - Linux:    google-chrome --remote-debugging-port=9222
+#   然后在已打开的 Chrome 里正常登录 voer.host 一次，再运行：
+python voer_renew.py run --cdp http://127.0.0.1:9222
+#   （未登录时脚本会轮询等待，你在浏览器里手动登一次即可）
+
+# 方式2: 用脚本自己的会话文件（首次在脚本浏览器里手动过验证码后保存）
+python voer_renew.py run --export-session session.json   # 首次：登录并保存
+python voer_renew.py run --cookies session.json          # 之后：直接用，免验证码
+
+# 方式3: 从你平时用的浏览器导出 cookie 注入（EditThisCookie 或
+#   Get cookies.txt 扩展导出，支持 JSON / cookies.txt 两种格式）
+python voer_renew.py run --cookies cookies.json
+
 # 只看状态（服务器列表、今日续签次数、剩余时间）
 python voer_renew.py status
 

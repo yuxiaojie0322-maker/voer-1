@@ -107,12 +107,28 @@ class VoerRenewer:
     def __init__(self, cfg: dict, args):
         self.cfg = cfg
         self.args = args
+        self.cdp_mode = False
         self.profile_dir = args.profile_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".profile")
         self.timeout_min = float(args.timeout_min or 10)
 
     # ---- 浏览器 ----
     def open_browser(self, pw):
-        """带头启动 Chromium + 持久化 profile（登录态跨次保存）。"""
+        """启动浏览器。
+        - --cdp: 直连用户已登录的真实 Chrome（复用其 cookie/localStorage/指纹）
+        - --cookies: 从已登录浏览器导出的 cookie 文件注入会话
+        - 默认: 带头启动 Chromium + 持久化 profile（登录态跨次保存）
+        """
+        # ---- 模式1: CDP 直连真实浏览器 ----
+        if self.args.cdp:
+            self.cdp_mode = True
+            log(f"直连真实浏览器: {self.args.cdp}")
+            self.browser = pw.chromium.connect_over_cdp(self.args.cdp)
+            self.ctx = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
+            self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+            self.page.set_default_timeout(30_000)
+            return self.page
+
+        # ---- 模式2/3: 本地 Chromium（可注入 cookie） ----
         launch_args = ["--lang=en-US"]
         if self.args.headless:
             launch_args.append("--headless=new")
@@ -130,11 +146,80 @@ class VoerRenewer:
         self.ctx = ctx
         self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self.page.set_default_timeout(30_000)
+
+        if self.args.cookies:
+            self.import_cookies(self.args.cookies)
         return self.page
+
+    # ---- cookie 注入 ----
+    def import_cookies(self, path: str):
+        """从文件导入会话：支持
+        1) Playwright storage_state JSON（含 cookies+localStorage）
+        2) EditThisCookie 导出的 JSON 数组
+        3) Netscape cookies.txt"""
+        import json as _json
+        raw = open(path, "r", encoding="utf-8").read().strip()
+        cookies = []
+        ls_payload = None
+        try:
+            data = _json.loads(raw)
+            if isinstance(data, dict) and "cookies" in data:  # storage_state
+                cookies = data.get("cookies", [])
+                ls_payload = data.get("origins", [])
+            elif isinstance(data, list):                      # cookie 数组
+                cookies = data
+        except _json.JSONDecodeError:
+            # Netscape cookies.txt: domain<TAB>flag<TAB>path<TAB>secure<TAB>expiry<TAB>name<TAB>value
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    domain, _, path, secure, expiry, name, value = parts[:7]
+                    cookies.append({
+                        "name": name, "value": value, "domain": domain,
+                        "path": path, "secure": secure.lower() == "true",
+                        "httpOnly": False, "expires": float(expiry),
+                    })
+        if cookies:
+            self.ctx.add_cookies(cookies)
+            log(f"已注入 {len(cookies)} 个 cookie（来自 {path}）")
+        if ls_payload:
+            # storage_state 里的 localStorage 逐源写回
+            for origin in ls_payload:
+                if origin.get("localStorage"):
+                    self.page.add_init_script(
+                        "() => {" +
+                        "".join(
+                            f'localStorage.setItem({_json.dumps(k)}, {_json.dumps(v)});'
+                            for k, v in origin["localStorage"]
+                        ) + "}"
+                    )
+            log("已注入 localStorage（来自 storage_state）")
 
     # ---- 登录（含 Turnstile）----
     def ensure_login(self):
         page = self.page
+
+        # CDP 模式：直接检测真实浏览器是否已登录；未登录则等用户在该浏览器里登
+        if self.cdp_mode:
+            page.goto(PANEL_URL, wait_until="domcontentloaded")
+            if "/login" not in page.url:
+                log(f"真实浏览器已登录，进入面板：{page.url}")
+                return
+            log("!! 当前真实浏览器未登录 voer.host。请在弹出的浏览器窗口里手动登录一次，")
+            log("   脚本会轮询等待（最多 5 分钟）…")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                time.sleep(5)
+                page.goto(PANEL_URL, wait_until="domcontentloaded")
+                if "/login" not in page.url:
+                    log("检测到已登录，继续 …")
+                    return
+            log("!! 等待登录超时，中止。")
+            sys.exit(4)
+
         log("打开登录页 …")
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
@@ -371,6 +456,15 @@ def parse_args():
     p.add_argument("--proxy", default=None,
                    help="代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
                         "（Clash/v2ray 等本地代理常见端口）")
+    p.add_argument("--cdp", default=None,
+                   help="直连已登录的真实 Chrome，例如 http://127.0.0.1:9222"
+                        "（需先以 --remote-debugging-port=9222 启动 Chrome）")
+    p.add_argument("--cookies", default=None,
+                   help="从已登录浏览器导出的会话文件：支持 Playwright storage_state"
+                        " JSON / EditThisCookie JSON 数组 / Netscape cookies.txt")
+    p.add_argument("--export-session", default=None,
+                   help="登录成功后把会话（cookie+localStorage）保存到此文件，"
+                        "之后可用 --cookies 复用")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
@@ -384,6 +478,14 @@ def main():
         renewer.open_browser(pw)
         try:
             renewer.ensure_login()
+
+            # 可选：保存会话供下次 --cookies 复用
+            if args.export_session:
+                try:
+                    renewer.ctx.storage_state(path=args.export_session)
+                    log(f"会话已保存到 {args.export_session}（下次可用 --cookies 加载）")
+                except Exception as e:
+                    log(f"保存会话失败: {e}")
 
             if args.action == "status":
                 renewer.print_status()
@@ -405,7 +507,10 @@ def main():
                 log("✗ 本次续签未完成。")
                 sys.exit(1)
         finally:
-            if not args.debug:
+            # CDP 模式连接的是用户自己的浏览器，绝不能关
+            if renewer.cdp_mode:
+                log("CDP 模式：已保持真实浏览器开启。")
+            elif not args.debug:
                 try:
                     renewer.ctx.close()
                 except Exception:
