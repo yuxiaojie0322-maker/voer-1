@@ -12,3 +12,6 @@ renew.log
 __pycache__/
 *.pyc
 .venv/
+# 本地代理节点配置（含节点凭据，切勿公开）
+hk_tuic_singbox.json
+singbox.log
