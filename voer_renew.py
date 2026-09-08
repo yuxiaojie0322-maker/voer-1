@@ -1,471 +1,911 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-voer_renew.py — Voer.host 免费服务器"看广告续签"自动化脚本
+voer_renew.py — Voer.host 免费服务器「看视频增加使用时间」全自动优化版
 
-原理：voer.host 免费档服务器每会话 4 小时，可在服务器详情页通过观看 Google
-激励广告（rewarded ads）续签 —— 3 个广告 = +4 小时，每个 UTC 日最多 4 次
-(=16 小时)，每个会话最多 4 次。广告播放器是站点内嵌 iframe /voer-ads-api.html。
-
-本脚本用 Playwright 驱动真实 Chromium（带头窗口，保证 Cloudflare Turnstile
-与 Google 广告能正常通过），完成：登录 → 打开服务器详情 → 点“Watch Ads” →
-等待 3 个广告依次播完并被服务端验证 → 自动结算 +4 小时。
-
-用法：
-    python voer_renew.py run                 # 续签一次（3 个广告 +4h），默认动作
-    python voer_renew.py run --server 名称    # 指定要续签的服务器（不指定则用第一台）
-    python voer_renew.py status              # 只打印服务器列表与可续签状态，不动作
-    python voer_renew.py probe               # 登录后把关键页面文本存盘（调试/反馈用）
-
-可选参数：
-    --config config.json     指定配置文件（默认读取同目录 config.json）
-    --profile-dir DIR        Chromium 用户数据目录（持久化登录态，默认同目录 .profile）
-    --headless               无头模式（Google 广告大概率拒绝投放，不推荐）
-    --timeout-min N          单次广告最长等待分钟数（默认 10）
-    --debug                  保留浏览器现场 & 打印更多日志
-
-首次运行：
-    1. pip install playwright &&  playwright install chromium
-    2. 编辑 config.json 填入账号密码
-    3. python voer_renew.py run
-    4. 弹出浏览器后若出现 Cloudflare 人机验证，手动勾选复选框 / 完成验证，
-       脚本会自动继续（登录按钮会从禁用变为可点）。
+核心特性与优化：
+1. 【Page Visibility 伪装】：深度伪装 document.hidden 与 visibilityState，拦截 blur 事件，
+   保证 Google 激励视频广告在后台、最小化或被遮挡时持续顺畅播放，彻底解决广告播放中断与超时问题。
+2. 【智能过验证与免密秒登】：集成 Stealth 反指纹；自动模拟点击 Cloudflare Turnstile 复选框；
+   登录成功后自动更新并持久化保存 Session（session.json），下次启动零验证码秒进面板。
+3. 【主动广告交互与弹窗接管】：深入 iframe 自动识别并点击 Play / Consent / Done / Close 按钮；
+   自动捕获与协同 "Open ad player" 弹出的独立播放器窗口（Popup）。
+4. 【前置 Geo 诊断与 90 秒防卡看门狗】：在看广告前自动检测 /api/servers/geo-info，若当前节点 IP
+   不支持广告立即给出清晰换节点指引；广告播放单步超时 90 秒自动刷新重试，避免死等。
+5. 【无人值守守护模式 (--loop)】：全自动循环续签，自动休眠至会话到期前唤醒，满 4 次自动等待次日 UTC 重置。
+6. 【多服务器支持 (--all) & 漂亮状态看板】：支持一键续签所有服务器，格式化显示剩余可用时长。
+7. 【多渠道消息推送】：支持 Telegram、Server酱、PushPlus、Discord 与自定义 Webhook 通知。
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ---------------------------------------------------------------------------
-# 常量（来自 voer.host 前端 i18n 字符串，站点改版时需同步更新）
+# 常量定义
 # ---------------------------------------------------------------------------
 BASE_URL = "https://voer.host"
 LOGIN_URL = BASE_URL + "/login"
 PANEL_URL = BASE_URL + "/panel"
-MAX_EXTENSIONS_PER_UTC_DAY = 4      # “A server can be extended up to 4 times per UTC day and per session.”
-ADS_PER_EXTENSION = 3               # “Each extension adds 4 hours for 3 rewarded ads.”
+GEO_INFO_URL = BASE_URL + "/api/servers/geo-info"
+MAX_EXTENSIONS_PER_UTC_DAY = 4      # 每天最多续签 4 次（每次 4 小时 = 最多 16 小时）
+ADS_PER_EXTENSION = 3               # 每次续签观看 3 个广告
 HOURS_PER_EXTENSION = 4
 
-# 页面 UI 文案（英文；脚本按这些关键词定位元素）
+# 页面关键词
 TXT_WATCH_ADS = "Watch Ads"
 TXT_EXTEND_NOW = "Extend Now"
-TXT_EXTENSIONS_TODAY = "Extensions today"
-TXT_TIME_REMAINING = "Time Remaining"
 TXT_ALL_VERIFIED = "All ads verified"
 TXT_PROGRESS_RESET = "Progress reset"
-TXT_CLOSE_GATE = "Close ad gate"
 TXT_OPEN_PLAYER = "Open ad player"
 
-# 广告播放器 iframe 特征
-PLAYER_IFRAME_TITLE = "Rewarded ad player"
 PLAYER_IFRAME_SRC = "voer-ads-api.html"
 
 # ---------------------------------------------------------------------------
-# 小工具
+# JS 注入补丁：Stealth 反指纹 + Page Visibility 伪装
 # ---------------------------------------------------------------------------
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+STEALTH_JS = """
+(() => {
+    // 隐藏 navigator.webdriver
+    try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    } catch(e) {}
+
+    // 伪造 chrome 对象
+    window.chrome = window.chrome || {
+        app: { isInstalled: false },
+        runtime: { PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' } },
+        loadTimes: function() {},
+        csi: function() {}
+    };
+
+    // 伪造语言与插件
+    try {
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    } catch(e) {}
+
+    // 修复权限 API
+    if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query;
+        navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                origQuery(parameters)
+        );
+    }
+})();
+"""
+
+PAGE_VISIBILITY_JS = """
+(() => {
+    // 深度伪装页面前台可见性，防止 Google 广告在后台/被遮挡时暂停播放
+    try {
+        Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+        Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+        Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+    } catch(e) {}
+
+    // 拦截并阻止 visibilitychange 等暂停信号
+    ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide'].forEach(evtName => {
+        window.addEventListener(evtName, (e) => {
+            e.stopImmediatePropagation();
+        }, true);
+        document.addEventListener(evtName, (e) => {
+            e.stopImmediatePropagation();
+        }, true);
+    });
+
+    // 恒定窗口有焦点
+    window.hasFocus = () => true;
+    document.hasFocus = () => true;
+})();
+"""
+
+
+# ---------------------------------------------------------------------------
+# 日志与工具函数
+# ---------------------------------------------------------------------------
+def log(msg: str, level: str = "INFO"):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prefix = {
+        "INFO": "[INFO]",
+        "WARN": "[WARN]",
+        "SUCCESS": "[SUCCESS]",
+        "ERROR": "[ERROR]",
+        "DEBUG": "[DEBUG]"
+    }.get(level, f"[{level}]")
+    print(f"[{ts}] {prefix} {msg}", flush=True)
 
 
 def utc_today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def format_ms(ms) -> str:
+    """将毫秒转化为容易阅读的 时:分 格式"""
+    try:
+        total_seconds = int(ms) // 1000
+        if total_seconds <= 0:
+            return "已过期"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        return f"{hours}小时{minutes}分"
+    except Exception:
+        return str(ms)
+
+
 def load_config(cfg_path: str) -> dict:
-    cfg = {"email": "", "password": "", "server_name": None}
+    cfg = {
+        "email": "",
+        "password": "",
+        "server_name": None,
+        "proxy": None,
+        "notify": {}
+    }
     if cfg_path and os.path.exists(cfg_path):
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    # 允许环境变量覆盖（对定时任务/CI 更安全）
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            log(f"读取配置文件失败: {e}", "WARN")
+
     cfg.setdefault("email", os.environ.get("VOER_EMAIL", ""))
     cfg.setdefault("password", os.environ.get("VOER_PASS", ""))
-    if not cfg.get("email") or not cfg.get("password"):
-        log("!! 缺少账号密码：请在 config.json 填写 email/password，")
-        log("   或设置环境变量 VOER_EMAIL / VOER_PASS")
-        sys.exit(2)
+    if os.environ.get("VOER_PROXY"):
+        cfg["proxy"] = os.environ.get("VOER_PROXY")
+
     return cfg
 
 
 def write_probe(tag: str, text: str):
     fn = f"probe_{tag}_{utc_today()}_{int(time.time())}.txt"
-    with open(fn, "w", encoding="utf-8") as f:
-        f.write(text)
-    log(f"probe: 已保存 {fn} ({len(text)} chars)")
+    try:
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(text)
+        log(f"已保存排查快照: {fn} ({len(text)} 字符)", "DEBUG")
+    except Exception as e:
+        log(f"保存排查快照失败: {e}", "WARN")
 
 
 # ---------------------------------------------------------------------------
-# 浏览器与登录
+# 推送通知模块
+# ---------------------------------------------------------------------------
+def send_notification(cfg: dict, title: str, content: str):
+    """支持 Telegram, Server酱, Pushplus, Discord 及通用 Webhook 推送"""
+    notify_cfg = cfg.get("notify", {})
+    if not notify_cfg:
+        return
+
+    # 1. Telegram
+    tg_token = notify_cfg.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN")
+    tg_chat_id = notify_cfg.get("tg_chat_id") or os.environ.get("TG_CHAT_ID")
+    if tg_token and tg_chat_id:
+        try:
+            url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+            payload = json.dumps({
+                "chat_id": tg_chat_id,
+                "text": f"*{title}*\n\n{content}",
+                "parse_mode": "Markdown"
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+            log("已发送 Telegram 通知", "DEBUG")
+        except Exception as e:
+            log(f"Telegram 推送失败: {e}", "WARN")
+
+    # 2. Server酱 (SendKey)
+    serverchan_key = notify_cfg.get("serverchan_key") or os.environ.get("SERVERCHAN_KEY")
+    if serverchan_key:
+        try:
+            url = f"https://sctapi.ftqq.com/{serverchan_key}.send"
+            data = urllib.parse.urlencode({"title": title, "desp": content}).encode("utf-8")
+            req = urllib.request.Request(url, data=data)
+            urllib.request.urlopen(req, timeout=10)
+            log("已发送 Server酱 通知", "DEBUG")
+        except Exception as e:
+            log(f"Server酱 推送失败: {e}", "WARN")
+
+    # 3. PushPlus
+    pushplus_token = notify_cfg.get("pushplus_token") or os.environ.get("PUSHPLUS_TOKEN")
+    if pushplus_token:
+        try:
+            url = "http://www.pushplus.plus/send"
+            payload = json.dumps({"token": pushplus_token, "title": title, "content": content}).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+            log("已发送 PushPlus 通知", "DEBUG")
+        except Exception as e:
+            log(f"PushPlus 推送失败: {e}", "WARN")
+
+    # 4. Webhook / Discord
+    webhook_url = notify_cfg.get("webhook_url") or os.environ.get("WEBHOOK_URL")
+    if webhook_url:
+        try:
+            payload = json.dumps({"title": title, "content": content, "text": f"{title}\n{content}"}).encode("utf-8")
+            req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+            log("已发送 Webhook 通知", "DEBUG")
+        except Exception as e:
+            log(f"Webhook 推送失败: {e}", "WARN")
+
+
+# ---------------------------------------------------------------------------
+# 核心续签控制器
 # ---------------------------------------------------------------------------
 class VoerRenewer:
     def __init__(self, cfg: dict, args):
         self.cfg = cfg
         self.args = args
         self.cdp_mode = False
-        self.profile_dir = args.profile_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".profile")
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.profile_dir = args.profile_dir or os.path.join(self.base_dir, ".profile")
+        self.session_file = args.session_file or os.path.join(self.base_dir, "session.json")
         self.timeout_min = float(args.timeout_min or 10)
+        self.popup_page = None
 
-    # ---- 浏览器 ----
+    def setup_page_hooks(self, target_page):
+        """给页面注入反检测与可见性欺骗补丁，并监听认证相关请求和错误提示"""
+        try:
+            target_page.add_init_script(STEALTH_JS)
+            target_page.add_init_script(PAGE_VISIBILITY_JS)
+            target_page.set_default_timeout(30_000)
+
+            # 监听认证相关的响应
+            def on_resp(r):
+                if any(k in r.url for k in ["/api/auth", "/api/login", "/api/servers"]):
+                    try:
+                        body_txt = r.text()[:200]
+                        log(f"[API 响应 {r.status}] {r.url} -> {body_txt}", "DEBUG")
+                    except Exception:
+                        log(f"[API 响应 {r.status}] {r.url}", "DEBUG")
+
+            target_page.on("response", on_resp)
+        except Exception as e:
+            log(f"注入页面钩子警告: {e}", "DEBUG")
+
     def open_browser(self, pw):
-        """启动浏览器。
-        - --cdp: 直连用户已登录的真实 Chrome（复用其 cookie/localStorage/指纹）
-        - --cookies: 从已登录浏览器导出的 cookie 文件注入会话
-        - 默认: 带头启动 Chromium + 持久化 profile（登录态跨次保存）
-        """
-        # ---- 模式1: CDP 直连真实浏览器 ----
+        """启动浏览器，支持 CDP、持久化目录与自动导入 Session"""
+        # 1. CDP 模式：直连已打开的 Chrome
         if self.args.cdp:
             self.cdp_mode = True
-            log(f"直连真实浏览器: {self.args.cdp}")
+            log(f"直连真实 Chrome 调试端口: {self.args.cdp}")
             self.browser = pw.chromium.connect_over_cdp(self.args.cdp)
             self.ctx = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
             self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
-            self.page.set_default_timeout(30_000)
+            self.setup_page_hooks(self.page)
+            self._listen_popups()
             return self.page
 
-        # ---- 模式2/3: 本地 Chromium（可注入 cookie） ----
-        launch_args = ["--lang=en-US"]
+        # 2. 本地独立启动模式
+        launch_args = [
+            "--lang=en-US",
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-blink-features=AutomationControlled",
+            "--no-default-browser-check",
+            "--disable-features=IsolateOrigins,site-per-process"
+        ]
         if self.args.headless:
             launch_args.append("--headless=new")
+
+        proxy_opt = None
+        proxy_url = self.args.proxy or self.cfg.get("proxy")
+        if proxy_url:
+            proxy_opt = {"server": proxy_url}
+            log(f"使用网络代理: {proxy_url}")
+
         ctx = pw.chromium.launch_persistent_context(
             self.profile_dir,
             headless=self.args.headless,
             args=launch_args,
-            viewport={"width": 1400, "height": 950},
+            viewport={"width": 1440, "height": 960},
             locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0.0.0 Safari/537.36"),
-            proxy={"server": self.args.proxy} if self.args.proxy else None,
+                        "Chrome/128.0.0.0 Safari/537.36"),
+            proxy=proxy_opt,
         )
         self.ctx = ctx
         self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        self.page.set_default_timeout(30_000)
+        self.setup_page_hooks(self.page)
 
-        if self.args.cookies:
-            self.import_cookies(self.args.cookies)
+        # 尝试自动加载已有 Session（优先从 --cookies 或默认 session.json）
+        cookie_path = self.args.cookies or (self.session_file if os.path.exists(self.session_file) else None)
+        if cookie_path and os.path.exists(cookie_path):
+            self.import_cookies(cookie_path)
+
+        self._listen_popups()
         return self.page
 
-    # ---- cookie 注入 ----
+    def _listen_popups(self):
+        """监听由主页面弹出的新标签页/独立播放器窗口"""
+        def on_popup(popup):
+            log(f"检测到弹出独立窗口: {popup.url or 'loading...'}")
+            self.popup_page = popup
+            self.setup_page_hooks(popup)
+            popup.on("close", lambda: setattr(self, "popup_page", None))
+        self.ctx.on("page", on_popup)
+
     def import_cookies(self, path: str):
-        """从文件导入会话：支持
-        1) Playwright storage_state JSON（含 cookies+localStorage）
-        2) EditThisCookie 导出的 JSON 数组
-        3) Netscape cookies.txt"""
-        import json as _json
-        raw = open(path, "r", encoding="utf-8").read().strip()
-        cookies = []
-        ls_payload = None
+        """导入会话信息"""
         try:
-            data = _json.loads(raw)
-            if isinstance(data, dict) and "cookies" in data:  # storage_state
-                cookies = data.get("cookies", [])
-                ls_payload = data.get("origins", [])
-            elif isinstance(data, list):                      # cookie 数组
-                cookies = data
-        except _json.JSONDecodeError:
-            # Netscape cookies.txt: domain<TAB>flag<TAB>path<TAB>secure<TAB>expiry<TAB>name<TAB>value
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    domain, _, path, secure, expiry, name, value = parts[:7]
-                    cookies.append({
-                        "name": name, "value": value, "domain": domain,
-                        "path": path, "secure": secure.lower() == "true",
-                        "httpOnly": False, "expires": float(expiry),
-                    })
-        if cookies:
-            self.ctx.add_cookies(cookies)
-            log(f"已注入 {len(cookies)} 个 cookie（来自 {path}）")
-        if ls_payload:
-            # storage_state 里的 localStorage 逐源写回
-            for origin in ls_payload:
-                if origin.get("localStorage"):
-                    self.page.add_init_script(
-                        "() => {" +
-                        "".join(
-                            f'localStorage.setItem({_json.dumps(k)}, {_json.dumps(v)});'
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if not raw:
+                return
+            data = json.loads(raw)
+            if isinstance(data, dict) and "cookies" in data:
+                self.ctx.add_cookies(data.get("cookies", []))
+                for origin in data.get("origins", []):
+                    if origin.get("localStorage"):
+                        script = "() => {" + "".join(
+                            f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
                             for k, v in origin["localStorage"]
                         ) + "}"
-                    )
-            log("已注入 localStorage（来自 storage_state）")
+                        self.page.add_init_script(script)
+                log(f"已自动加载 Session 文件 ({path})，享受免密直连")
+            elif isinstance(data, list):
+                self.ctx.add_cookies(data)
+                log(f"已导入 {len(data)} 个 Cookie ({path})")
+        except Exception as e:
+            log(f"导入 Session 出现异常: {e}", "DEBUG")
 
-    # ---- 登录（含 Turnstile）----
+    def save_session(self):
+        """自动保存当前登录态供下次启动零验证码秒登"""
+        try:
+            self.ctx.storage_state(path=self.session_file)
+            log(f"已自动持久化登录 Session -> {self.session_file}", "SUCCESS")
+        except Exception as e:
+            log(f"保存 Session 失败: {e}", "DEBUG")
+
+    # ------------------------------------------------------------------
+    # 智能 Cloudflare Turnstile 与 登录
+    # ------------------------------------------------------------------
+    def try_solve_turnstile(self) -> bool:
+        """尝试自动识别并模拟点击 Turnstile 验证复选框"""
+        page = self.page
+        found = False
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
+                found = True
+                for sel in ["input[type=checkbox]", ".ctp-checkbox-label", "#challenge-stage", "[aria-label*='Cloudflare']", ".cb-lb"]:
+                    try:
+                        box = frame.locator(sel)
+                        if box.count() and box.first.is_visible():
+                            log("检测到 Turnstile 验证框，正在模拟鼠标悬停并点击...", "DEBUG")
+                            box.first.hover()
+                            time.sleep(0.2)
+                            box.first.click(delay=120)
+                            return True
+                    except Exception:
+                        pass
+        return found
+
+    def check_is_logged_in(self) -> bool:
+        """准确检查当前是否处于登录状态（排除 SPA 延迟重定向和未登录表单）"""
+        page = self.page
+        if "/login" in page.url:
+            return False
+        try:
+            # 检查是否有登录输入框
+            if page.locator("#login-email, input[type='password']").count() > 0:
+                return False
+            # 检查是否有控制台特征元素
+            txt = page.locator("body").inner_text()
+            if any(k in txt for k in ["귀하의 계정에 로그인하세요", "Sign in to your account", "Log in to your account"]):
+                return False
+        except Exception:
+            pass
+        return True
+
     def ensure_login(self):
         page = self.page
 
-        # CDP 模式：直接检测真实浏览器是否已登录；未登录则等用户在该浏览器里登
+        # CDP 模式
         if self.cdp_mode:
             page.goto(PANEL_URL, wait_until="domcontentloaded")
-            if "/login" not in page.url:
-                log(f"真实浏览器已登录，进入面板：{page.url}")
+            time.sleep(3)
+            if self.check_is_logged_in():
+                log(f"Chrome 已登录，进入控制台：{page.url}")
                 return
-            log("!! 当前真实浏览器未登录 voer.host。请在弹出的浏览器窗口里手动登录一次，")
-            log("   脚本会轮询等待（最多 5 分钟）…")
+            log("当前 Chrome 尚未登录 voer.host，请在浏览器中手动登录一次...")
             deadline = time.time() + 300
             while time.time() < deadline:
-                time.sleep(5)
+                time.sleep(4)
                 page.goto(PANEL_URL, wait_until="domcontentloaded")
-                if "/login" not in page.url:
-                    log("检测到已登录，继续 …")
+                if self.check_is_logged_in():
+                    log("检测到已成功登录，继续执行")
                     return
-            log("!! 等待登录超时，中止。")
+            log("等待登录超时", "ERROR")
             sys.exit(4)
 
-        log("打开登录页 …")
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        # 检查是否已凭 Session 直登面板
+        page.goto(PANEL_URL, wait_until="domcontentloaded")
+        time.sleep(3)
+        if self.check_is_logged_in():
+            log(f"Session 有效，免密直接进入控制台：{page.url}", "SUCCESS")
+            return
 
-        # 关闭隐私弹窗（klaro）
+        # 前往登录页
+        log("Session 未生效或首次运行，打开登录页面...")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        time.sleep(2)
+
+        # 尝试自动关掉 Cookie 授权弹窗
         try:
-            btn = page.get_by_role("button", name="Accept")
-            if btn.count() and btn.is_visible():
-                btn.click()
-                log("已接受 Cookie 弹窗")
+            accept_btn = page.locator("button:has-text('Accept'), button:has-text('동의'), button:has-text('I agree')")
+            if accept_btn.count() and accept_btn.first.is_visible():
+                accept_btn.first.click()
         except Exception:
             pass
 
-        # 已登录则直接跳面板
-        page.goto(PANEL_URL, wait_until="domcontentloaded")
-        if "/login" not in page.url:
-            log(f"已登录，直接进入面板：{page.url}")
-            return
+        # 填入账号密码
+        email = self.cfg.get("email")
+        password = self.cfg.get("password")
+        if not email or not password:
+            log("缺少账号密码！请在 config.json 填写 email 与 password 或设置环境变量", "ERROR")
+            sys.exit(2)
 
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        page.locator("#login-email").fill(self.cfg["email"])
-        page.locator("#login-password").fill(self.cfg["password"])
-        log("账号密码已填写，等待 Turnstile 验证 …")
+        try:
+            # 兼容多种定位器
+            email_input = page.locator("#login-email, input[type='email'], input[name='email']").first
+            pass_input = page.locator("#login-password, input[type='password'], input[name='password']").first
+            
+            email_input.scroll_into_view_if_needed()
+            email_input.fill(email)
+            pass_input.fill(password)
+            log(f"已自动填入账号 ({email}) 与密码，正在检测人机安全验证...")
+        except Exception as e:
+            log(f"填写登录表单异常: {e}", "WARN")
 
-        submit = page.get_by_role("button", name="Sign in")
-        deadline = time.time() + 300  # 最多等 5 分钟让人手工完成验证码
+        # 真正的提交按钮（必须严格为 type='submit'，避开小眼睛按钮）
+        submit = page.locator("form button[type='submit'], button[type='submit']").first
+
+        # 智能等待/自动点击 Turnstile 验证码
+        start_t = time.time()
+        deadline = start_t + 90  # 最多等待 90 秒
+        auto_clicked = False
+
+        log("正在检测并等待 Cloudflare Turnstile 验证通过...")
         while time.time() < deadline:
             if submit.is_enabled():
+                log("Cloudflare Turnstile 验证已通过！", "SUCCESS")
                 break
+
+            # 每隔一段时间尝试重新自动定位并点击 Turnstile
+            if not auto_clicked or int(time.time() - start_t) % 10 == 0:
+                if self.try_solve_turnstile():
+                    auto_clicked = True
+
             time.sleep(2)
+
         if not submit.is_enabled():
             write_probe("login_stuck", page.locator("body").inner_text())
-            log("!! Turnstile 验证长时间未通过。请在弹出的浏览器窗口里勾选/完成")
-            log("   Cloudflare 验证（若出现拼图等挑战也手动完成），然后按回车继续 …")
-            input("   完成验证后按 Enter 继续 …")
+            log("!! Cloudflare Turnstile 验证未自动通过。若是人工运行，请在浏览器中勾选复选框...", "WARN")
+            if sys.stdin and sys.stdin.isatty():
+                print(">>> 完成验证后请在终端按 Enter 继续 <<<")
+                try:
+                    input()
+                except Exception:
+                    pass
+            else:
+                # 非交互环境再多等 20 秒
+                for _ in range(10):
+                    if submit.is_enabled():
+                        break
+                    time.sleep(2)
+
         if not submit.is_enabled():
-            log("!! 验证仍未通过，中止。可重跑脚本（登录态会保留）。")
+            log("验证仍未通过，请检查网络或重新运行", "ERROR")
             sys.exit(3)
 
         submit.click()
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(3)
-        if "/login" in page.url:
-            body = page.locator("body").inner_text()
-            write_probe("login_failed", body)
-            log("!! 登录似乎失败，页面仍停留在 /login。请检查账号密码是否正确、")
-            log("   是否需要邮箱验证，或在浏览器里手动登录一次。")
-            sys.exit(4)
-        log("登录成功")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        time.sleep(5)
 
-    # ---- 面板内 API 辅助（利用页面自身 cookie 发请求）----
+        for _ in range(10):
+            if self.check_is_logged_in():
+                break
+            time.sleep(1)
+
+        if not self.check_is_logged_in():
+            try:
+                page.screenshot(path="login_failed.png")
+            except Exception:
+                pass
+            err_texts = []
+            try:
+                for el in page.locator(".text-red-500, .text-rose-500, [role='alert'], .toast, .alert").all():
+                    if el.is_visible():
+                        t = el.inner_text().strip()
+                        if t:
+                            err_texts.append(t)
+            except Exception:
+                pass
+            err_msg = " | ".join(err_texts) if err_texts else "页面未捕获到红色错误文本"
+            write_probe("login_failed", page.locator("body").inner_text())
+            log(f"登录失败！页面提示: 【{err_msg}】。截图已存为 login_failed.png", "ERROR")
+            sys.exit(4)
+
+        log("账号登录成功！", "SUCCESS")
+        # 自动保存会话，以便下次免登录
+        self.save_session()
+
+    # ------------------------------------------------------------------
+    # 前置诊断与服务器数据
+    # ------------------------------------------------------------------
     def api_get(self, url: str) -> dict:
         return self.page.evaluate(
             """async (u) => {
-                const r = await fetch(u, { credentials: 'include', headers: {'Accept':'application/json'} });
-                return { status: r.status, body: await r.json().catch(()=>null) };
+                try {
+                    const r = await fetch(u, { credentials: 'include', headers: {'Accept':'application/json'} });
+                    return { status: r.status, body: await r.json().catch(()=>null) };
+                } catch(e) {
+                    return { status: 0, error: e.message };
+                }
             }""", url)
 
-    # ------------------------------------------------------------------
-    # 状态查询
-    # ------------------------------------------------------------------
+    def check_geo_support(self) -> bool:
+        """检查当前 IP 所在地区是否受 Google 激励广告支持"""
+        res = self.api_get(GEO_INFO_URL)
+        body = res.get("body") or {}
+        if body.get("blocked"):
+            country = body.get("countryIso", "未知")
+            log(f"!! 当前 IP 节点国家/地区 ({country}) 被 Voer.host 广告提供商判定为不支持！", "WARN")
+            log("   原因：该地区无法获取 Google 激励视频广告，继续运行极可能发生超时。", "WARN")
+            log("   解决建议：使用 --proxy 参数挂载常用节点（如香港、台湾、日本、欧美优质家庭代理）。", "WARN")
+            return False
+        return True
+
     def get_servers(self) -> list:
-        """返回服务器列表。字段名以实际返回为准。"""
         res = self.api_get("/api/servers")
         data = res.get("body")
-        servers = []
         if isinstance(data, list):
-            servers = data
-        elif isinstance(data, dict):
-            servers = data.get("servers") or data.get("data") or []
+            return data
+        if isinstance(data, dict):
+            return data.get("servers") or data.get("data") or []
+        return []
+
+    def print_status(self) -> list:
+        servers = self.get_servers()
+        if not servers:
+            log("未查询到有效服务器列表，可能接口结构变更或当前账号无服务器", "WARN")
+            return []
+
+        print("\n" + "=" * 70)
+        print("                   VOER.HOST 服务器状态一览")
+        print("=" * 70)
+        for idx, s in enumerate(servers, 1):
+            sid = s.get("id", "?")
+            name = s.get("name") or s.get("minecraftName") or s.get("gameName") or f"Server #{idx}"
+            status = s.get("status", "unknown")
+            ext_today = s.get("extensionsToday", s.get("extensions_today", 0))
+            ms_left = s.get("timeRemainingMs", s.get("timeRemaining", 0))
+            readable_time = format_ms(ms_left)
+
+            print(f"[{idx}] 服务器: {name} (ID: {sid})")
+            print(f"    - 运行状态: {status}")
+            print(f"    - 今日续签: {ext_today} / {MAX_EXTENSIONS_PER_UTC_DAY} 次 (已延长 {int(ext_today)*HOURS_PER_EXTENSION} 小时)")
+            print(f"    - 剩余使用时间: {readable_time}")
+            print("-" * 70)
         return servers
 
-    def print_status(self):
-        servers = self.get_servers()
-        if not servers:
-            log("没有查到服务器（字段结构未知，probe 模式可帮助定位）。")
-            write_probe("servers_api", json.dumps(self.api_get("/api/servers"), ensure_ascii=False, indent=2))
-            return
-        log(f"共 {len(servers)} 台服务器：")
-        for s in servers:
-            sid = s.get("id", "?")
-            name = s.get("name") or s.get("minecraftName") or s.get("gameName") or "?"
-            status = s.get("status", "?")
-            ext_today = s.get("extensionsToday", s.get("extensions_today", "?"))
-            remaining_s = s.get("timeRemainingMs", s.get("timeRemaining", "?"))
-            log(f"  - id={sid}  name={name}  status={status}  extensionsToday={ext_today}  timeLeft={remaining_s}")
-
-    def pick_server_id(self) -> str:
-        servers = self.get_servers()
-        if not servers:
-            log("!! 服务器列表为空或结构未知。请先用 probe 模式反馈，或手动打开服务器页。")
-            sys.exit(5)
-        if self.args.server:
-            for s in servers:
-                nm = s.get("name") or ""
-                if self.args.server.lower() in nm.lower():
-                    return str(s.get("id"))
-            log(f"!! 没有找到名字包含 '{self.args.server}' 的服务器。")
-            sys.exit(6)
-        return str(servers[0].get("id"))
-
     # ------------------------------------------------------------------
-    # 看广告续签
+    # 交互式广告播放引擎（深入 iframe 与独立播放器窗口）
     # ------------------------------------------------------------------
-    def extend_once(self, server_id: str) -> bool:
+    def scan_and_interact_ads(self):
+        """遍历主页面、所有 iframe 以及独立 Popup 窗口，主动点击播放、同意、关闭等按钮"""
+        all_targets = [self.page]
+        if self.popup_page and not self.popup_page.is_closed():
+            all_targets.append(self.popup_page)
+
+        for target in all_targets:
+            # 1. 深入所有 frame
+            frames = target.frames
+            for f in frames:
+                # 检查播放按钮
+                try:
+                    # 常见的 Google 广告播放/继续按钮
+                    for sel in [
+                        "button:has-text('Play')",
+                        "button:has-text('Start')",
+                        "button:has-text('Continue')",
+                        "button:has-text('Tap to play')",
+                        "[aria-label='Play']",
+                        ".reward-button"
+                    ]:
+                        btn = f.locator(sel)
+                        if btn.count() and btn.first.is_visible():
+                            log("检测到广告播放交互按钮，自动触发点击...", "DEBUG")
+                            btn.first.click(timeout=1000)
+                            break
+
+                    # 检查 CMP / GDPR 授权按钮
+                    for sel in [
+                        "button:has-text('Accept')",
+                        "button:has-text('I agree')",
+                        "button:has-text('Consent')",
+                        "[aria-label='Consent']"
+                    ]:
+                        c_btn = f.locator(sel)
+                        if c_btn.count() and c_btn.first.is_visible():
+                            log("检测到授权弹窗，自动确认...", "DEBUG")
+                            c_btn.first.click(timeout=1000)
+                            break
+
+                    # 检查完成/关闭按钮
+                    for sel in [
+                        "button:has-text('Close')",
+                        "button:has-text('Done')",
+                        "[aria-label='Close ad']",
+                        ".reward-close"
+                    ]:
+                        close_btn = f.locator(sel)
+                        if close_btn.count() and close_btn.first.is_visible():
+                            log("检测到广告结束确认按钮，自动点击结算...", "DEBUG")
+                            close_btn.first.click(timeout=1000)
+                            break
+                except Exception:
+                    pass
+
+            # 2. 如果主页面有 "Open ad player" 按钮且播放器未加载，点击打开独立窗口
+            try:
+                open_p_btn = target.get_by_role("button", name=TXT_OPEN_PLAYER)
+                if open_p_btn.count() and open_p_btn.is_visible():
+                    log("内嵌播放器降级，自动点击 'Open ad player' 唤起独立窗口...", "INFO")
+                    open_p_btn.click(timeout=2000)
+            except Exception:
+                pass
+
+    def extend_once(self, server_id: str, server_name: str = "") -> bool:
+        """执行单次续签 (+4 小时，观看 3 个视频广告)"""
         page = self.page
         url = f"{BASE_URL}/panel/server/{server_id}"
-        log(f"打开服务器详情页 {url}")
+        log(f"正在打开服务器详情页: {url}")
         page.goto(url, wait_until="domcontentloaded")
         time.sleep(3)
 
         body_text = lambda: page.locator("body").inner_text()
 
-        # 检查"今日续签次数"是否已满
-        m = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
+        # 1. 检查今日续签是否已达上限
+        txt = body_text()
+        m = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", txt)
         if m:
             used, total = int(m.group(1)), int(m.group(2))
-            log(f"今日已续签 {used}/{total} 次")
-            if used >= total:
-                log("!! 已达到今日续签上限，无需继续。")
-                return False
-            if used >= MAX_EXTENSIONS_PER_UTC_DAY:
-                log(f"!! 已达到脚本设定的每日上限 {MAX_EXTENSIONS_PER_UTC_DAY} 次。")
-                return False
-        else:
-            log("(未在页面找到 'Extensions today' 计数，继续尝试)")
+            log(f"今日已续签: {used}/{total} 次")
+            if used >= total or used >= MAX_EXTENSIONS_PER_UTC_DAY:
+                log(f"服务器【{server_name or server_id}】今日续签次数已达上限 ({used}/{total})，无需重复续签", "SUCCESS")
+                return True
 
-        # 点击 "Watch Ads"（免费档）按钮打开续签弹窗
+        # 2. 前置 Geo 诊断
+        self.check_geo_support()
+
+        # 3. 点击 "Watch Ads" 或 "Extend Now" 按钮
         clicked = False
         for name in (TXT_WATCH_ADS, TXT_EXTEND_NOW):
             b = page.get_by_role("button", name=name)
             if b.count() and b.is_visible():
-                log(f"点击按钮: {name}")
+                log(f"点击【{name}】按钮唤起看广告弹窗")
                 b.click()
                 clicked = True
                 break
+
         if not clicked:
             write_probe("no_watch_ads", body_text())
-            log("!! 没找到 'Watch Ads / Extend Now' 按钮。已保存页面快照 probe_no_watch_ads*.txt，")
-            log("   请把它发给我以便修正选择器。")
+            log("未在页面中找到 'Watch Ads' 按钮，可能当前会话不支持或该服务器无权续签", "WARN")
             return False
+
         time.sleep(3)
 
-        # 等待弹窗出现（可能出现 "Watch Ads to Extend" 标题）
-        gate_visible = self.wait_text(["Watch Ads to Extend", "Extend Session", "rewarded ads required", "Open ad player"], timeout=30)
-        if not gate_visible:
+        # 4. 等待续签弹窗加载
+        gate_found = False
+        for _ in range(15):
+            cur_txt = body_text()
+            if any(k in cur_txt for k in ["Watch Ads to Extend", "Extend Session", "rewarded ads required", "Open ad player"]):
+                gate_found = True
+                break
+            time.sleep(1)
+
+        if not gate_found:
             write_probe("no_gate", body_text())
-            log("!! 续签弹窗未出现。已保存快照 probe_no_gate*.txt。")
+            log("续签弹窗加载超时", "ERROR")
             return False
 
-        # 主循环：等待 3 个广告依次被验证
-        seen = set()
-        all_done = False
+        log("已成功激活广告播放器，开始观看激励广告...", "SUCCESS")
+
+        # 5. 核心观看循环（含状态轮询、按钮点击与 90 秒卡死看门狗）
+        current_ad = 0
+        last_progress_time = time.time()
         start_wait = time.time()
-        while time.time() - start_wait < self.timeout_min * 60:
+        max_duration = self.timeout_min * 60
+
+        while time.time() - start_wait < max_duration:
             txt = body_text()
 
-            # 播放器 iframe 是否存在
-            frame = self.find_player_frame()
+            # 匹配当前广告进度
+            m_ad = re.search(r"Watching ad (\d+) of (\d+)", txt)
+            if m_ad:
+                cur, total = int(m_ad.group(1)), int(m_ad.group(2))
+                if cur != current_ad:
+                    current_ad = cur
+                    last_progress_time = time.time()
+                    log(f"-> 广告观看进度: 第 {cur}/{total} 个广告播放中...", "INFO")
 
-            m2 = re.search(r"Watching ad (\d+) of (\d+)", txt)
-            if m2:
-                cur, need = int(m2.group(1)), int(m2.group(2))
-                if need and (cur, need) not in seen:
-                    seen.add((cur, need))
-                    log(f"进度: 第 {cur}/{need} 个广告（已验证 {cur - 1} 个）")
+            # 检测全部验证完成
+            if TXT_ALL_VERIFIED in txt or "All ads verified" in txt:
+                log("恭喜！3 个广告已全部验证通过，正在自动结算...", "SUCCESS")
+                time.sleep(6)
+                # 刷新页面验证新状态
+                page.goto(url, wait_until="domcontentloaded")
+                time.sleep(3)
+                m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
+                log(f"续签完成！当前今日已续签: {m3.group(0) if m3 else '?'} (+4小时使用时间)", "SUCCESS")
+                send_notification(
+                    self.cfg,
+                    f"Voer.host 续签成功: {server_name or server_id}",
+                    f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: {m3.group(0) if m3 else '已更新'}"
+                )
+                return True
 
-            if TXT_ALL_VERIFIED in txt:
-                log("检测到 'All ads verified. Starting your 4 hour session...'")
-                all_done = True
-                break
-
+            # 进度被重置提示
             if "watch all 3 ads again" in txt.lower() or TXT_PROGRESS_RESET in txt:
-                log("!! 广告进度被重置（可能需要更“人工”的播放环境）。继续尝试…")
+                log("广告进度被提供商重置，自动重新拉取新广告...", "WARN")
+                last_progress_time = time.time()
 
-            # 缺帧时尝试打开独立播放器
-            if frame is None and TXT_OPEN_PLAYER in txt:
-                b = page.get_by_role("button", name=TXT_OPEN_PLAYER)
-                if b.count() and b.is_visible():
-                    log("内嵌播放器不可用，尝试打开独立播放器窗口")
-                    b.click()
-                    time.sleep(3)
-                    continue
+            # 尝试主动交互
+            self.scan_and_interact_ads()
 
-            time.sleep(5)
+            # 90 秒防卡死看门狗
+            if time.time() - last_progress_time > 90:
+                log("当前广告播放超 90 秒无进度更新，触发看门狗自动重试...", "WARN")
+                # 尝试点击 Try another ad 按钮
+                try:
+                    retry_btn = page.locator("button:has-text('Try another ad'), button:has-text('Reload')")
+                    if retry_btn.count() and retry_btn.first.is_visible():
+                        retry_btn.first.click()
+                except Exception:
+                    pass
+                last_progress_time = time.time()
 
-        if all_done:
-            log("三个广告已全部验证，等待结算 …")
-            time.sleep(8)
-            # 结算后刷新页面确认续签结果
-            page.goto(url, wait_until="domcontentloaded")
             time.sleep(3)
-            m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
-            log(f"续签完成。当前页面显示 Extensions today: {m3.group(0) if m3 else '?'}（+4h）")
-            return True
 
         write_probe("extend_timeout", body_text())
-        log("!! 等待广告超时。已保存快照 probe_extend_timeout*.txt。")
-        log("   常见原因：Google 无广告可投（地区/库存）、严格广告过滤、或无头模式被识别。")
+        log("单次看广告超时未完成，常见原因为当前代理 IP 缺乏广告库存或网络断流", "ERROR")
         return False
-
-    def wait_text(self, needles: list, timeout: int = 30) -> bool:
-        page = self.page
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                txt = page.locator("body").inner_text(timeout=3000)
-            except Exception:
-                txt = ""
-            for n in needles:
-                if n in txt:
-                    return True
-            time.sleep(1)
-        return False
-
-    def find_player_frame(self):
-        for frame in self.page.frames:
-            src = frame.url or ""
-            if PLAYER_IFRAME_SRC in src or "voer-ads" in src:
-                return frame
-        return None
 
 
 # ---------------------------------------------------------------------------
-# main
+# 业务流程入口
 # ---------------------------------------------------------------------------
+def run_renew(renewer: VoerRenewer, args):
+    """单次运行或全量续签"""
+    renewer.print_status()
+    servers = renewer.get_servers()
+    if not servers:
+        log("未找到可用的服务器", "ERROR")
+        return False
+
+    targets = []
+    if args.all:
+        targets = servers
+    elif args.server:
+        for s in servers:
+            name = s.get("name") or ""
+            if args.server.lower() in name.lower() or str(s.get("id")) == str(args.server):
+                targets.append(s)
+                break
+        if not targets:
+            log(f"未找到名称或 ID 包含 '{args.server}' 的服务器", "ERROR")
+            return False
+    else:
+        # 默认续签第一台
+        targets = [servers[0]]
+
+    all_success = True
+    for s in targets:
+        sid = str(s.get("id"))
+        sname = s.get("name") or sid
+        log(f"\n>>> 开始为服务器【{sname}】(ID: {sid}) 执行看视频续签...")
+        ok = renewer.extend_once(sid, sname)
+        if not ok:
+            all_success = False
+        time.sleep(3)
+
+    return all_success
+
+
+def daemon_loop(renewer: VoerRenewer, args):
+    """
+    无人值守守护挂机模式：
+    自动监测使用时间，在需要续签时看视频增加时间；达到当日 4 次上限后自动休眠等待至次日 UTC 0 点重置。
+    """
+    log("已进入【无人值守守护模式】，脚本将 7x24 小时保持运行并自动管理服务器使用时间...", "SUCCESS")
+
+    while True:
+        try:
+            log("正在巡检服务器状态...")
+            servers = renewer.print_status()
+            if not servers:
+                log("未检测到服务器，将在 10 分钟后重试...", "WARN")
+                time.sleep(600)
+                continue
+
+            all_day_full = True
+            min_remaining_s = 24 * 3600
+
+            for s in servers:
+                ext_today = int(s.get("extensionsToday", s.get("extensions_today", 0)))
+                ms_left = int(s.get("timeRemainingMs", s.get("timeRemaining", 0)))
+                sec_left = max(0, ms_left // 1000)
+                sid = str(s.get("id"))
+                sname = s.get("name") or sid
+
+                if ext_today < MAX_EXTENSIONS_PER_UTC_DAY:
+                    all_day_full = False
+                    # 如果剩余时间小于 3.5 小时，或者剩余时间不足，立即续签
+                    if sec_left < 3.5 * 3600:
+                        log(f"服务器【{sname}】剩余时间不足 ({format_ms(ms_left)})，今日已续 {ext_today}/4 次，立即启动看视频续签！")
+                        renewer.extend_once(sid, sname)
+                    else:
+                        log(f"服务器【{sname}】剩余时间充足 ({format_ms(ms_left)})，暂无需续签。")
+                        min_remaining_s = min(min_remaining_s, sec_left - int(3 * 3600))
+                else:
+                    log(f"服务器【{sname}】今日 4 次续签名额已全部用满（已延长 16 小时）。")
+
+            if all_day_full:
+                # 计算距离下一个 UTC 00:05 的秒数
+                now = datetime.now(timezone.utc)
+                seconds_until_utc_midnight = (24 * 3600) - (now.hour * 3600 + now.minute * 60 + now.second) + 300
+                hours_wait = round(seconds_until_utc_midnight / 3600, 1)
+                log(f"账号下所有服务器今日续签已满额！脚本进入休眠，将于次日 UTC 重置后唤醒（约 {hours_wait} 小时后）", "SUCCESS")
+                time.sleep(seconds_until_utc_midnight)
+                continue
+
+            # 决定下一次休眠时间（最短 15 分钟，最长 3 小时）
+            sleep_sec = max(900, min(min_remaining_s, 3 * 3600))
+            log(f"本次巡检完成，计划在 {sleep_sec // 60} 分钟后进行下一次状态巡检...", "INFO")
+            time.sleep(sleep_sec)
+
+        except KeyboardInterrupt:
+            log("用户终止守护进程，退出。", "INFO")
+            break
+        except Exception as e:
+            log(f"守护循环出现异常: {e}，将在 5 分钟后自动恢复...", "ERROR")
+            time.sleep(300)
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Voer.host 看广告续签脚本")
-    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe"])
-    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
-    p.add_argument("--server", default=None, help="服务器名称关键字（默认第一台）")
-    p.add_argument("--profile-dir", default=None)
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--timeout-min", default=10, help="单次续签最长等待分钟数")
-    p.add_argument("--proxy", default=None,
-                   help="代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
-                        "（Clash/v2ray 等本地代理常见端口）")
-    p.add_argument("--cdp", default=None,
-                   help="直连已登录的真实 Chrome，例如 http://127.0.0.1:9222"
-                        "（需先以 --remote-debugging-port=9222 启动 Chrome）")
-    p.add_argument("--cookies", default=None,
-                   help="从已登录浏览器导出的会话文件：支持 Playwright storage_state"
-                        " JSON / EditThisCookie JSON 数组 / Netscape cookies.txt")
-    p.add_argument("--export-session", default=None,
-                   help="登录成功后把会话（cookie+localStorage）保存到此文件，"
-                        "之后可用 --cookies 复用")
-    p.add_argument("--debug", action="store_true")
+    p = argparse.ArgumentParser(description="Voer.host 看视频自动增加使用时间脚本 (深度优化版)")
+    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe", "loop", "login"])
+    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+                   help="配置文件路径")
+    p.add_argument("--server", default=None, help="指定要续签的服务器名称或 ID")
+    p.add_argument("--all", action="store_true", help="一键为账号下所有服务器执行续签")
+    p.add_argument("--loop", action="store_true", help="开启无人值守守护模式（7x24小时全自动续签挂机）")
+    p.add_argument("--profile-dir", default=None, help="Chromium 用户数据持久化目录")
+    p.add_argument("--session-file", default=None, help="会话持久化存储文件 (默认 session.json)")
+    p.add_argument("--cookies", default=None, help="自定义导入 cookie / session 路径")
+    p.add_argument("--proxy", default=None, help="代理地址 (例如 http://127.0.0.1:7890)")
+    p.add_argument("--cdp", default=None, help="直连已打开的真实 Chrome 端口 (例如 http://127.0.0.1:9222)")
+    p.add_argument("--headless", action="store_true", help="无头模式运行")
+    p.add_argument("--timeout-min", default=10, help="单次续签超时时间（分钟）")
+    p.add_argument("--debug", action="store_true", help="调试模式：保留浏览器窗口")
     return p.parse_args()
 
 
@@ -477,15 +917,24 @@ def main():
     with sync_playwright() as pw:
         renewer.open_browser(pw)
         try:
-            renewer.ensure_login()
+            if args.action == "login":
+                log("已进入【登录与 Session 提取模式】，正在打开登录页面...")
+                renewer.ensure_login()
+                renewer.save_session()
+                # 打印单行 Session 供 GitHub Secrets 复制
+                if os.path.exists(renewer.session_file):
+                    with open(renewer.session_file, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    print("\n" + "=" * 70)
+                    print("【GitHub Actions 部署专用】复制下方整行内容填入 GitHub Secrets:")
+                    print("Secret 名称: VOER_SESSION")
+                    print("=" * 70)
+                    print(content)
+                    print("=" * 70 + "\n")
+                    log("Session 提取成功！已在当前目录保存 session.json", "SUCCESS")
+                return
 
-            # 可选：保存会话供下次 --cookies 复用
-            if args.export_session:
-                try:
-                    renewer.ctx.storage_state(path=args.export_session)
-                    log(f"会话已保存到 {args.export_session}（下次可用 --cookies 加载）")
-                except Exception as e:
-                    log(f"保存会话失败: {e}")
+            renewer.ensure_login()
 
             if args.action == "status":
                 renewer.print_status()
@@ -496,27 +945,28 @@ def main():
                 write_probe("panel", renewer.page.locator("body").inner_text())
                 return
 
-            # run：默认先查状态，再续签一次
-            renewer.print_status()
-            sid = renewer.pick_server_id()
-            log(f"对服务器 {sid} 执行续签 …")
-            ok = renewer.extend_once(sid)
-            if ok:
-                log("✓ 续签完成：+4 小时。建议每 4 小时运行一次（注意每日 4 次上限）。")
+            if args.action == "loop" or args.loop:
+                daemon_loop(renewer, args)
+                return
+
+            # run 动作
+            success = run_renew(renewer, args)
+            if success:
+                log("任务执行完成！", "SUCCESS")
             else:
-                log("✗ 本次续签未完成。")
+                log("部分或全部续签任务未完成，请参阅日志排查", "WARN")
                 sys.exit(1)
+
         finally:
-            # CDP 模式连接的是用户自己的浏览器，绝不能关
             if renewer.cdp_mode:
-                log("CDP 模式：已保持真实浏览器开启。")
-            elif not args.debug:
+                log("CDP 模式：保持外部真实浏览器开启。")
+            elif not args.debug and not (args.action == "loop" or args.loop):
                 try:
                     renewer.ctx.close()
                 except Exception:
                     pass
             else:
-                log("--debug：浏览器保持打开，请手动关闭。")
+                log("浏览器保持打开状态。")
 
 
 if __name__ == "__main__":

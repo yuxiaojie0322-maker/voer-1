@@ -1,5 +1,13 @@
 {
-  "email": "你的邮箱@example.com",
-  "password": "你的密码",
-  "server_name": null
+  "email": "your_email@example.com",
+  "password": "your_password",
+  "server_name": null,
+  "proxy": "http://127.0.0.1:7890",
+  "notify": {
+    "tg_bot_token": "",
+    "tg_chat_id": "",
+    "serverchan_key": "",
+    "pushplus_token": "",
+    "webhook_url": ""
+  }
 }

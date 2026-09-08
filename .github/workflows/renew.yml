@@ -1,0 +1,96 @@
+name: Voer.host 自动看视频续签
+
+on:
+  schedule:
+    # 每 4 小时第 15 分运行一次 (UTC 时间: 00:15, 04:15, 08:15, 12:15, 16:15, 20:15)
+    - cron: '15 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      renew_all:
+        description: '是否为所有服务器续签 (--all)'
+        required: true
+        type: boolean
+        default: true
+      timeout_min:
+        description: '单次续签超时时间(分钟)'
+        required: false
+        default: '12'
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装 Playwright 与系统依赖
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+          sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: 导入登录凭证与配置
+        env:
+          VOER_SESSION_SECRET: ${{ secrets.VOER_SESSION }}
+          VOER_CONFIG_SECRET: ${{ secrets.VOER_CONFIG }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASS: ${{ secrets.VOER_PASS }}
+          VOER_PROXY: ${{ secrets.VOER_PROXY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          # 1. 优先加载 VOER_SESSION 绕过 Turnstile
+          if [ -n "$VOER_SESSION_SECRET" ]; then
+            echo "$VOER_SESSION_SECRET" > session.json
+            echo "已成功注入 VOER_SESSION，将免验证码直连控制台！"
+          fi
+
+          # 2. 如果存在完整 VOER_CONFIG，写入 config.json
+          if [ -n "$VOER_CONFIG_SECRET" ]; then
+            echo "$VOER_CONFIG_SECRET" > config.json
+          else
+            # 从单独的环境变量生成 config.json
+            python -c "
+          import json, os
+          cfg = {
+              'email': os.environ.get('VOER_EMAIL', ''),
+              'password': os.environ.get('VOER_PASS', ''),
+              'proxy': os.environ.get('VOER_PROXY') or None,
+              'notify': {
+                  'tg_bot_token': os.environ.get('TG_BOT_TOKEN', ''),
+                  'tg_chat_id': os.environ.get('TG_CHAT_ID', ''),
+                  'serverchan_key': os.environ.get('SERVERCHAN_KEY', ''),
+                  'pushplus_token': os.environ.get('PUSHPLUS_TOKEN', ''),
+                  'webhook_url': os.environ.get('WEBHOOK_URL', '')
+              }
+          }
+          with open('config.json', 'w', encoding='utf-8') as f:
+              json.dump(cfg, f, indent=2)
+          "
+          fi
+
+      - name: 执行看视频续签 (Xvfb 虚拟桌面伪装)
+        id: run_renew
+        run: |
+          # 采用 xvfb 虚拟桌面环境，规避无头模式检测，确保 Google 广告顺畅播放
+          xvfb-run -a python voer_renew.py run --all --timeout-min ${{ github.event.inputs.timeout_min || '12' }}
+
+      - name: 发生异常时上传诊断快照与截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voer-debug-artifacts
+          path: |
+            probe_*.txt
+            *.png
+            renew.log
+          retention-days: 3
