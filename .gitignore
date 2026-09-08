@@ -1,0 +1,14 @@
+# 敏感信息：账号密码，切勿推送到公开仓库
+config.json
+
+# 浏览器登录态（含 cookies/token）
+.profile/
+
+# 调试快照与日志
+probe_*.txt
+renew.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
