@@ -570,6 +570,75 @@ class VoerRenewer:
             return data.get("servers") or data.get("data") or []
         return []
 
+    def parse_server_state(self, s: dict) -> dict:
+        """解析服务器的剩余时间、到期时间、今日续签次数等详细信息"""
+        sid = str(s.get("id", ""))
+        name = s.get("name") or s.get("minecraftName") or s.get("gameName") or sid
+        status = s.get("status", "unknown")
+
+        # 若列表没有返回 sessionExpiresAt 或 sessionExtensionsToday，则尝试查询详情接口补全
+        expires_at = s.get("sessionExpiresAt") or s.get("expiresAt")
+        ext = s.get("sessionExtensionsToday")
+
+        if (not expires_at or ext is None) and sid and self.page:
+            try:
+                res = self.api_get(f"/api/servers/{sid}")
+                body = res.get("body")
+                if isinstance(body, dict):
+                    srv = body.get("server") or body
+                    if isinstance(srv, dict):
+                        s.update(srv)
+                        expires_at = s.get("sessionExpiresAt") or s.get("expiresAt")
+                        if ext is None:
+                            ext = s.get("sessionExtensionsToday")
+                        if not status or status == "unknown":
+                            status = s.get("status", "unknown")
+            except Exception:
+                pass
+
+        # 解析今日已续签次数
+        if ext is None:
+            ext = s.get("extensionsToday", s.get("extensions_today", 0))
+        try:
+            ext_today = int(ext)
+        except Exception:
+            ext_today = 0
+
+        # 解析剩余时间
+        sec_left = 0
+        readable_time = "未知"
+        if expires_at and isinstance(expires_at, str):
+            try:
+                exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                now_dt = datetime.now(timezone.utc)
+                sec_left = int((exp_dt - now_dt).total_seconds())
+                if sec_left > 0:
+                    hrs = sec_left // 3600
+                    mins = (sec_left % 3600) // 60
+                    readable_time = f"{hrs}小时{mins}分"
+                else:
+                    readable_time = "已过期"
+            except Exception:
+                readable_time = "解析异常"
+        elif s.get("timeRemainingMs") or s.get("timeRemaining"):
+            ms = s.get("timeRemainingMs") or s.get("timeRemaining")
+            try:
+                sec_left = max(0, int(ms) // 1000)
+                readable_time = format_ms(ms)
+            except Exception:
+                pass
+
+        return {
+            "id": sid,
+            "name": name,
+            "status": status,
+            "ext_today": ext_today,
+            "sec_left": sec_left,
+            "readable_time": readable_time,
+            "expires_at": expires_at,
+            "raw": s
+        }
+
     def print_status(self) -> list:
         servers = self.get_servers()
         if not servers:
@@ -580,17 +649,17 @@ class VoerRenewer:
         print("                   VOER.HOST 服务器状态一览")
         print("=" * 70)
         for idx, s in enumerate(servers, 1):
-            sid = s.get("id", "?")
-            name = s.get("name") or s.get("minecraftName") or s.get("gameName") or f"Server #{idx}"
-            status = s.get("status", "unknown")
-            ext_today = s.get("extensionsToday", s.get("extensions_today", 0))
-            ms_left = s.get("timeRemainingMs", s.get("timeRemaining", 0))
-            readable_time = format_ms(ms_left)
+            info = self.parse_server_state(s)
+            sid = info["id"]
+            name = info["name"]
+            status = info["status"]
+            ext_today = info["ext_today"]
+            readable_time = info["readable_time"]
 
             print(f"[{idx}] 服务器: {name} (ID: {sid})")
             print(f"    - 运行状态: {status}")
-            print(f"    - 今日续签: {ext_today} / {MAX_EXTENSIONS_PER_UTC_DAY} 次 (已延长 {int(ext_today)*HOURS_PER_EXTENSION} 小时)")
-            print(f"    - 剩余使用时间: {readable_time}")
+            print(f"    - 今日续签: {ext_today} / {MAX_EXTENSIONS_PER_UTC_DAY} 次 (已延长 {ext_today*HOURS_PER_EXTENSION} 小时)")
+            print(f"    - 剩余使用时间: {readable_time} (到期时间: {info['expires_at'] or '未知'})")
             print("-" * 70)
         return servers
 
@@ -750,8 +819,28 @@ class VoerRenewer:
                     req_ads = flow.get("adsRequired", 3)
                     done_ads = flow.get("completedAds", 0)
                     if status == "completed" or (done_ads >= req_ads and req_ads > 0):
-                        log(f"🎉 服务端实时确认：3 个广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在结算...", "SUCCESS")
-                        time.sleep(4)
+                        log(f"🎉 服务端实时确认：3 个广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
+                        time.sleep(2)
+                        # 显式调用 Voer 后端完成 session extension 结算接口
+                        flow_id = flow.get("flowId")
+                        if flow_id:
+                            try:
+                                page.evaluate(f"""async (fid) => {{
+                                    try {{
+                                        const token = localStorage.getItem("token") || "";
+                                        const headers = {{ "Content-Type": "application/json" }};
+                                        if (token) headers["Authorization"] = `Bearer ${{token}}`;
+                                        await fetch('/api/servers/{server_id}/extension-ad-complete', {{
+                                            method: 'POST',
+                                            headers: headers,
+                                            body: JSON.stringify({{ flowId: fid }}),
+                                            credentials: 'include'
+                                        }});
+                                    }} catch(e) {{}}
+                                }}""", flow_id)
+                            except Exception:
+                                pass
+                        time.sleep(3)
                         # 尝试点击任何可能存在的完成/结算/关闭按钮
                         for sel in ["button:has-text('Done')", "button:has-text('Claim')", "button:has-text('Close')", "button:has-text('완료')", "button:has-text('확인')"]:
                             try:
@@ -764,12 +853,17 @@ class VoerRenewer:
                         # 刷新页面验证新状态
                         page.goto(url, wait_until="domcontentloaded")
                         time.sleep(4)
-                        m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
-                        log(f"续签大功告成！当前今日已续签: {m3.group(0) if m3 else '已更新'} (+4小时使用时间)", "SUCCESS")
+
+                        # 解析服务器最新状态
+                        info = self.parse_server_state({"id": server_id, "name": server_name})
+                        m3 = re.search(r"Extensions today\s*(\d+\s*/\s*\d+)", body_text())
+                        ext_disp = re.sub(r"\s+", "", m3.group(1)) if m3 else f"{info['ext_today']}/4"
+
+                        log(f"续签大功告成！当前状态: 剩余 {info['readable_time']} (今日已续签 {ext_disp} 次)", "SUCCESS")
                         send_notification(
                             self.cfg,
-                            f"🎉 Voer.host 续签成功: {server_name or server_id}",
-                            f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: {m3.group(0) if m3 else '已成功更新'}"
+                            f"🎉 Voer.host 续签成功: {info['name']}",
+                            f"服务器: {info['name']}\n进度: +4 小时使用时间\n剩余使用时间: {info['readable_time']}\n今日已续签: {ext_disp} 次"
                         )
                         return True
                     elif done_ads > 0 and done_ads != current_ad:
@@ -897,10 +991,8 @@ def run_renew(renewer: VoerRenewer, args):
         if latest_servers:
             summary_lines = []
             for s in latest_servers:
-                sname = s.get("name") or s.get("id")
-                ext = s.get("extensionsToday", s.get("extensions_today", 0))
-                ms_left = s.get("timeRemainingMs", s.get("timeRemaining", 0))
-                summary_lines.append(f"• *{sname}*: 剩余 {format_ms(ms_left)} (今日已续 {ext}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)")
+                info = renewer.parse_server_state(s)
+                summary_lines.append(f"• *{info['name']}*: 剩余 {info['readable_time']} (今日已续 {info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)")
             
             status_text = "全部成功 ✅" if all_success else "部分失败 ⚠️"
             msg = f"执行结果: {status_text}\n\n当前服务器状态：\n" + "\n".join(summary_lines)
@@ -931,20 +1023,21 @@ def daemon_loop(renewer: VoerRenewer, args):
             min_remaining_s = 24 * 3600
 
             for s in servers:
-                ext_today = int(s.get("extensionsToday", s.get("extensions_today", 0)))
-                ms_left = int(s.get("timeRemainingMs", s.get("timeRemaining", 0)))
-                sec_left = max(0, ms_left // 1000)
-                sid = str(s.get("id"))
-                sname = s.get("name") or sid
+                info = renewer.parse_server_state(s)
+                ext_today = info["ext_today"]
+                sec_left = info["sec_left"]
+                sid = info["id"]
+                sname = info["name"]
+                readable_time = info["readable_time"]
 
                 if ext_today < MAX_EXTENSIONS_PER_UTC_DAY:
                     all_day_full = False
                     # 如果剩余时间小于 3.5 小时，或者剩余时间不足，立即续签
                     if sec_left < 3.5 * 3600:
-                        log(f"服务器【{sname}】剩余时间不足 ({format_ms(ms_left)})，今日已续 {ext_today}/4 次，立即启动看视频续签！")
+                        log(f"服务器【{sname}】剩余时间不足 ({readable_time})，今日已续 {ext_today}/4 次，立即启动看视频续签！")
                         renewer.extend_once(sid, sname)
                     else:
-                        log(f"服务器【{sname}】剩余时间充足 ({format_ms(ms_left)})，暂无需续签。")
+                        log(f"服务器【{sname}】剩余时间充足 ({readable_time})，暂无需续签。")
                         min_remaining_s = min(min_remaining_s, sec_left - int(3 * 3600))
                 else:
                     log(f"服务器【{sname}】今日 4 次续签名额已全部用满（已延长 16 小时）。")
