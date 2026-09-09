@@ -597,69 +597,66 @@ class VoerRenewer:
     # ------------------------------------------------------------------
     # 交互式广告播放引擎（深入 iframe 与独立播放器窗口）
     # ------------------------------------------------------------------
-    def scan_and_interact_ads(self):
-        """遍历主页面、所有 iframe 以及独立 Popup 窗口，主动点击播放、同意、关闭等按钮"""
-        all_targets = [self.page]
+    def get_all_ad_targets(self):
+        targets = [self.page]
         if self.popup_page and not self.popup_page.is_closed():
-            all_targets.append(self.popup_page)
+            targets.append(self.popup_page)
+        return targets
 
-        for target in all_targets:
-            # 1. 深入所有 frame
-            frames = target.frames
-            for f in frames:
-                # 检查播放按钮
-                try:
-                    # 常见的 Google 广告播放/继续按钮
-                    for sel in [
-                        "button:has-text('Play')",
-                        "button:has-text('Start')",
-                        "button:has-text('Continue')",
-                        "button:has-text('Tap to play')",
-                        "[aria-label='Play']",
-                        ".reward-button"
-                    ]:
-                        btn = f.locator(sel)
-                        if btn.count() and btn.first.is_visible():
-                            log("检测到广告播放交互按钮，自动触发点击...", "DEBUG")
-                            btn.first.click(timeout=1000)
-                            break
+    def try_start_video(self):
+        """仅在视频尚未开始时，尝试点击可能存在的启动/授权按钮"""
+        for target in self.get_all_ad_targets():
+            for f in target.frames:
+                # 授权弹窗确认
+                for sel in ["button:has-text('Accept')", "button:has-text('I agree')", "button:has-text('Consent')", "[aria-label='Consent']"]:
+                    try:
+                        c_btn = f.locator(sel).first
+                        if c_btn.count() and c_btn.is_visible():
+                            c_btn.click(timeout=1000)
+                            return
+                    except Exception:
+                        pass
+                # 初始封面播放按钮
+                for sel in ["button:has-text('Play')", "button:has-text('Start')", "[aria-label='Play']", ".reward-button"]:
+                    try:
+                        btn = f.locator(sel).first
+                        if btn.count() and btn.is_visible():
+                            btn.click(timeout=1000)
+                            return
+                    except Exception:
+                        pass
 
-                    # 检查 CMP / GDPR 授权按钮
-                    for sel in [
-                        "button:has-text('Accept')",
-                        "button:has-text('I agree')",
-                        "button:has-text('Consent')",
-                        "[aria-label='Consent']"
-                    ]:
-                        c_btn = f.locator(sel)
-                        if c_btn.count() and c_btn.first.is_visible():
-                            log("检测到授权弹窗，自动确认...", "DEBUG")
-                            c_btn.first.click(timeout=1000)
-                            break
-
-                    # 检查完成/关闭按钮
-                    for sel in [
-                        "button:has-text('Close')",
-                        "button:has-text('Done')",
-                        "[aria-label='Close ad']",
-                        ".reward-close"
-                    ]:
-                        close_btn = f.locator(sel)
-                        if close_btn.count() and close_btn.first.is_visible():
-                            log("检测到广告结束确认按钮，自动点击结算...", "DEBUG")
-                            close_btn.first.click(timeout=1000)
-                            break
-                except Exception:
-                    pass
-
-            # 2. 如果主页面有 "Open ad player" 按钮且播放器未加载，点击打开独立窗口
-            try:
-                open_p_btn = target.get_by_role("button", name=TXT_OPEN_PLAYER)
-                if open_p_btn.count() and open_p_btn.is_visible():
-                    log("内嵌播放器降级，自动点击 'Open ad player' 唤起独立窗口...", "INFO")
-                    open_p_btn.click(timeout=2000)
-            except Exception:
-                pass
+    def find_and_click_close_button(self) -> bool:
+        """
+        在所有页面及嵌套 iframe 中，检测视频播放完毕后才出现的 Close 关闭按钮
+        只有当视频播放完成出现真正可见的 Close 时才执行点击
+        """
+        close_selectors = [
+            "button[aria-label='Close ad']",
+            "button[aria-label='Close']",
+            "[aria-label*='Close' i]",
+            "#dismiss-button",
+            "div[id='dismiss-button']",
+            "button:has-text('Close')",
+            "button:has-text('닫기')",
+            "div[id='close-button']",
+            ".reward-close",
+            "[aria-label*='닫기']"
+        ]
+        for target in self.get_all_ad_targets():
+            for f in target.frames:
+                for sel in close_selectors:
+                    try:
+                        btn = f.locator(sel).first
+                        if btn.count() and btn.is_visible():
+                            box = btn.bounding_box()
+                            if box and box["width"] > 8 and box["height"] > 8:
+                                log(f"🎯 视频播放完毕，检测到 Close 按钮 ({sel})，点击进入下一步！", "SUCCESS")
+                                btn.click(timeout=2000)
+                                return True
+                    except Exception:
+                        pass
+        return False
 
     def extend_once(self, server_id: str, server_name: str = "") -> bool:
         """执行单次续签 (+4 小时，观看 3 个视频广告)"""
@@ -729,8 +726,9 @@ class VoerRenewer:
 
         log("已成功激活广告播放器，开始观看激励广告...", "SUCCESS")
 
-        # 5. 核心观看循环（含状态轮询、按钮点击与 90 秒卡死看门狗）
+        # 5. 核心观看循环（依次观看 3 个视频，播放完毕等待 Close 按钮）
         current_ad = 0
+        ad_start_time = time.time()
         last_progress_time = time.time()
         start_wait = time.time()
         max_duration = self.timeout_min * 60
@@ -738,18 +736,9 @@ class VoerRenewer:
         while time.time() - start_wait < max_duration:
             txt = body_text()
 
-            # 匹配当前广告进度
-            m_ad = re.search(r"Watching ad (\d+) of (\d+)", txt)
-            if m_ad:
-                cur, total = int(m_ad.group(1)), int(m_ad.group(2))
-                if cur != current_ad:
-                    current_ad = cur
-                    last_progress_time = time.time()
-                    log(f"-> 广告观看进度: 第 {cur}/{total} 个广告播放中...", "INFO")
-
             # 检测全部验证完成
             if TXT_ALL_VERIFIED in txt or "All ads verified" in txt:
-                log("恭喜！3 个广告已全部验证通过，正在自动结算...", "SUCCESS")
+                log("🎉 3 个视频广告已全部验证通过，正在自动结算使用时间...", "SUCCESS")
                 time.sleep(6)
                 # 刷新页面验证新状态
                 page.goto(url, wait_until="domcontentloaded")
@@ -763,18 +752,49 @@ class VoerRenewer:
                 )
                 return True
 
+            # 匹配当前广告进度 (1 of 3, 2 of 3, 3 of 3)
+            m_ad = re.search(r"Watching ad (\d+) of (\d+)", txt)
+            if m_ad:
+                cur, total = int(m_ad.group(1)), int(m_ad.group(2))
+                if cur != current_ad:
+                    current_ad = cur
+                    ad_start_time = time.time()
+                    last_progress_time = time.time()
+                    log(f"🎬 开始播放第 {cur}/{total} 个广告，正在等待视频播放倒计时...", "INFO")
+
+            # 检查是否有独立播放器弹窗降级按钮
+            try:
+                open_p_btn = page.get_by_role("button", name=TXT_OPEN_PLAYER)
+                if open_p_btn.count() and open_p_btn.is_visible():
+                    log("内嵌播放器降级，点击 'Open ad player' 唤起独立窗口...", "INFO")
+                    open_p_btn.click(timeout=2000)
+            except Exception:
+                pass
+
             # 进度被重置提示
             if "watch all 3 ads again" in txt.lower() or TXT_PROGRESS_RESET in txt:
-                log("广告进度被提供商重置，自动重新拉取新广告...", "WARN")
+                log("广告进度被重置，重新开始播放...", "WARN")
+                ad_start_time = time.time()
                 last_progress_time = time.time()
 
-            # 尝试主动交互
-            self.scan_and_interact_ads()
+            # 核心生命周期控制：
+            elapsed = time.time() - ad_start_time
+            if elapsed < 12:
+                # 视频刚开始播放的前 12 秒：专心等待视频播放，绝不点击关闭，确保奖励有效
+                self.try_start_video()
+                time.sleep(2)
+                continue
+            else:
+                # 12 秒之后：视频进入尾声，开始持续探测并点击已显现的 Close 按钮
+                clicked_close = self.find_and_click_close_button()
+                if clicked_close:
+                    time.sleep(3)  # 点击 Close 后等待 3 秒以使后端结算并跳到下一个视频
+                    last_progress_time = time.time()
+                    continue
 
             # 90 秒防卡死看门狗
             if time.time() - last_progress_time > 90:
                 log("当前广告播放超 90 秒无进度更新，触发看门狗自动重试...", "WARN")
-                # 尝试点击 Try another ad 按钮
                 try:
                     retry_btn = page.locator("button:has-text('Try another ad'), button:has-text('Reload')")
                     if retry_btn.count() and retry_btn.first.is_visible():
@@ -782,8 +802,9 @@ class VoerRenewer:
                 except Exception:
                     pass
                 last_progress_time = time.time()
+                ad_start_time = time.time()
 
-            time.sleep(3)
+            time.sleep(2)
 
         write_probe("extend_timeout", body_text())
         log("单次看广告超时未完成，常见原因为当前代理 IP 缺乏广告库存或网络断流", "ERROR")
