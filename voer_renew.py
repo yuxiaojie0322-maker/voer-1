@@ -805,21 +805,22 @@ class VoerRenewer:
         while time.time() - start_wait < max_duration:
             txt = body_text()
 
-            # 方式 A：直接通过底层 API 状态检测 adStartFlow 是否已完成 (completedAds >= 3)
+            # 方式 A：直接通过底层 API 状态检测 sessionExtensionFlow 是否已完成 (completedAds >= 3)
             try:
-                live_data = page.evaluate(f"""async () => {{
+                srv_data = page.evaluate(f"""async () => {{
                     try {{
-                        const r = await fetch('/api/servers/{server_id}/live', {{ credentials: 'include' }});
+                        const r = await fetch('/api/servers/{server_id}', {{ credentials: 'include' }});
                         return await r.json();
                     }} catch(e) {{ return null; }}
                 }}""")
-                if live_data and isinstance(live_data, dict):
-                    flow = (live_data.get("live") or {}).get("adStartFlow") or {}
+                if srv_data and isinstance(srv_data, dict):
+                    server_obj = srv_data.get("server") or srv_data
+                    flow = server_obj.get("sessionExtensionFlow") or {}
                     status = flow.get("status")
                     req_ads = flow.get("adsRequired", 3)
                     done_ads = flow.get("completedAds", 0)
                     if status == "completed" or (done_ads >= req_ads and req_ads > 0):
-                        log(f"🎉 服务端实时确认：3 个广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
+                        log(f"🎉 服务端实时确认：3 个续签广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
                         time.sleep(2)
                         # 显式调用 Voer 后端完成 session extension 结算接口
                         flow_id = flow.get("flowId")
