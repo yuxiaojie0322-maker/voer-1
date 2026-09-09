@@ -474,78 +474,55 @@ class VoerRenewer:
         # 真正的提交按钮（必须严格为 type='submit'，避开小眼睛按钮）
         submit = page.locator("form button[type='submit'], button[type='submit']").first
 
-        # 智能等待/自动点击 Turnstile 验证码
+        # 提示用户
+        log("已为您打开浏览器窗口并自动填写账号密码。")
+        log("如果弹出 Cloudflare 人机验证，请在浏览器窗口中勾选复选框；亦可直接在浏览器中登录。")
+
+        # 智能等待/自动点击 Turnstile 验证码并轮询登录态
         start_t = time.time()
-        deadline = start_t + 90  # 最多等待 90 秒
+        deadline = start_t + 180  # 给予充分的 3 分钟窗口
         auto_clicked = False
+        last_hint_time = 0
 
-        log("正在检测并等待 Cloudflare Turnstile 验证通过...")
         while time.time() < deadline:
-            if submit.is_enabled():
-                log("Cloudflare Turnstile 验证已通过！", "SUCCESS")
-                break
+            # 优先检测是否已经成功进入控制台（可能用户点击了快捷登录或直接跳过了）
+            if self.check_is_logged_in():
+                log("检测到已成功进入控制台！", "SUCCESS")
+                self.save_session()
+                return
 
-            # 每隔一段时间尝试重新自动定位并点击 Turnstile
-            if not auto_clicked or int(time.time() - start_t) % 10 == 0:
+            # 如果提交按钮被激活，自动点击提交
+            try:
+                if submit.is_enabled():
+                    log("检测到安全验证已通过，自动提交登录表单...", "SUCCESS")
+                    submit.click()
+                    time.sleep(3)
+                    if self.check_is_logged_in():
+                        log("账号登录成功！", "SUCCESS")
+                        self.save_session()
+                        return
+            except Exception:
+                pass
+
+            # 尝试自动定位并点击 Turnstile
+            if not auto_clicked or int(time.time() - start_t) % 8 == 0:
                 if self.try_solve_turnstile():
                     auto_clicked = True
 
-            time.sleep(2)
+            # 每隔 15 秒友善提醒一次
+            if time.time() - last_hint_time > 15:
+                last_hint_time = time.time()
+                log("等待登录中... 若浏览器窗口出现复选框，请在浏览器中手动点击一次；也可点下方 Google/Discord 快捷登录。")
 
-        if not submit.is_enabled():
-            write_probe("login_stuck", page.locator("body").inner_text())
-            log("!! Cloudflare Turnstile 验证未自动通过。若是人工运行，请在浏览器中勾选复选框...", "WARN")
-            if sys.stdin and sys.stdin.isatty():
-                print(">>> 完成验证后请在终端按 Enter 继续 <<<")
-                try:
-                    input()
-                except Exception:
-                    pass
-            else:
-                # 非交互环境再多等 20 秒
-                for _ in range(10):
-                    if submit.is_enabled():
-                        break
-                    time.sleep(2)
-
-        if not submit.is_enabled():
-            log("验证仍未通过，请检查网络或重新运行", "ERROR")
-            sys.exit(3)
-
-        submit.click()
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
-            pass
-        time.sleep(5)
-
-        for _ in range(10):
-            if self.check_is_logged_in():
-                break
-            time.sleep(1)
+            time.sleep(1.5)
 
         if not self.check_is_logged_in():
             try:
                 page.screenshot(path="login_failed.png")
             except Exception:
                 pass
-            err_texts = []
-            try:
-                for el in page.locator(".text-red-500, .text-rose-500, [role='alert'], .toast, .alert").all():
-                    if el.is_visible():
-                        t = el.inner_text().strip()
-                        if t:
-                            err_texts.append(t)
-            except Exception:
-                pass
-            err_msg = " | ".join(err_texts) if err_texts else "页面未捕获到红色错误文本"
-            write_probe("login_failed", page.locator("body").inner_text())
-            log(f"登录失败！页面提示: 【{err_msg}】。截图已存为 login_failed.png", "ERROR")
+            log("登录等待超时。截图已存为 login_failed.png", "ERROR")
             sys.exit(4)
-
-        log("账号登录成功！", "SUCCESS")
-        # 自动保存会话，以便下次免登录
-        self.save_session()
 
     # ------------------------------------------------------------------
     # 前置诊断与服务器数据
@@ -925,12 +902,25 @@ def main():
                 if os.path.exists(renewer.session_file):
                     with open(renewer.session_file, "r", encoding="utf-8") as f:
                         content = f.read().strip()
+                    
+                    # 尝试自动复制到系统剪贴板
+                    copied_to_clip = False
+                    try:
+                        import subprocess
+                        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+                        p.communicate(input=content.encode("utf-8"))
+                        copied_to_clip = True
+                    except Exception:
+                        pass
+
                     print("\n" + "=" * 70)
                     print("【GitHub Actions 部署专用】复制下方整行内容填入 GitHub Secrets:")
                     print("Secret 名称: VOER_SESSION")
                     print("=" * 70)
                     print(content)
                     print("=" * 70 + "\n")
+                    if copied_to_clip:
+                        log("【超贴心提示】整串凭据已自动写入系统剪贴板！直接去 GitHub 粘贴 (Ctrl+V) 即可！", "SUCCESS")
                     log("Session 提取成功！已在当前目录保存 session.json", "SUCCESS")
                 return
 
