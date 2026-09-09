@@ -28,6 +28,18 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
+# 解决 Windows 控制台编码问题 (防止 emoji 或多语言字符导致 UnicodeEncodeError)
+if sys.stdout:
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr:
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ---------------------------------------------------------------------------
@@ -260,9 +272,11 @@ class VoerRenewer:
             target_page.add_init_script(PAGE_VISIBILITY_JS)
             target_page.set_default_timeout(30_000)
 
-            # 监听认证相关的响应
+            # 监听认证与服务器相关的非流式响应
             def on_resp(r):
                 if any(k in r.url for k in ["/api/auth", "/api/login", "/api/servers"]):
+                    if "ad-progress-stream" in r.url:
+                        return
                     try:
                         body_txt = r.text()[:200]
                         log(f"[API 响应 {r.status}] {r.url} -> {body_txt}", "DEBUG")
@@ -673,55 +687,91 @@ class VoerRenewer:
         return targets
 
     def try_start_video(self):
-        """仅在视频尚未开始时，尝试点击可能存在的启动/授权按钮"""
+        """尝试激活广告：包括 Wormies 内部的 #watchBtn、Google Funding Choices 的 'View a short ad' 等"""
+        # 1. 优先检测 Google Funding Choices 弹出的 "View a short ad" 确认按钮
+        for target in self.get_all_ad_targets():
+            try:
+                fc_btn = target.locator("button.fc-rewarded-ad-button, button:has-text('View a short ad'), button:has-text('광고 보기')").first
+                if fc_btn.count() and fc_btn.is_visible():
+                    log("点击 Google 激励广告激活卡片【View a short ad】启动播放...", "SUCCESS")
+                    fc_btn.click(force=True)
+                    return True
+            except Exception:
+                pass
+
+        # 2. 检测并点击 Wormies iframe 内部的 #watchBtn
+        for target in self.get_all_ad_targets():
+            try:
+                wb = target.frame_locator('iframe[src*="wormies"]').locator('#watchBtn')
+                if wb.count() and wb.first.is_visible():
+                    log("点击 Wormies 播放器【Watch Ad】按钮...", "SUCCESS")
+                    wb.first.click(force=True)
+                    time.sleep(1)
+                    # 紧接着再次检测是否弹出了 View a short ad
+                    try:
+                        fc_btn = target.locator("button.fc-rewarded-ad-button, button:has-text('View a short ad')").first
+                        if fc_btn.count() and fc_btn.is_visible():
+                            fc_btn.click(force=True)
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                pass
+
+        # 3. 如果误弹出了 "Close Ad? You will lose your reward" 警告弹窗，自动点击 RESUME 继续看
         for target in self.get_all_ad_targets():
             for f in target.frames:
-                # 授权弹窗确认
-                for sel in ["button:has-text('Accept')", "button:has-text('I agree')", "button:has-text('Consent')", "[aria-label='Consent']"]:
+                try:
+                    res_btn = f.locator(".resume-ad-button, button:has-text('RESUME')").first
+                    if res_btn.count() and res_btn.is_visible():
+                        log("检测到提前关闭提示，自动点击【RESUME】恢复激励视频播放！", "INFO")
+                        res_btn.click(force=True)
+                        return True
+                except Exception:
+                    pass
+
+        # 4. 其他常规授权与播放按钮
+        for target in self.get_all_ad_targets():
+            for f in target.frames:
+                for sel in ["button:has-text('Accept')", "button:has-text('I agree')", "button:has-text('Consent')"]:
                     try:
                         c_btn = f.locator(sel).first
                         if c_btn.count() and c_btn.is_visible():
                             c_btn.click(timeout=1000)
-                            return
+                            return True
                     except Exception:
                         pass
-                # 初始封面播放按钮
-                for sel in ["button:has-text('Play')", "button:has-text('Start')", "[aria-label='Play']", ".reward-button"]:
-                    try:
-                        btn = f.locator(sel).first
-                        if btn.count() and btn.is_visible():
-                            btn.click(timeout=1000)
-                            return
-                    except Exception:
-                        pass
+        return False
 
     def find_and_click_close_button(self) -> bool:
         """
-        在所有页面及嵌套 iframe 中，检测视频播放完毕后才出现的 Close 关闭按钮
-        只有当视频播放完成出现真正可见的 Close 时才执行点击
+        在 Google AdSense / 播放器专属 iframe 中检测播放完毕后的 Close 按钮
+        注意：严格排除主页面的 Close ad gate，避免关闭整个续签弹窗！
         """
         close_selectors = [
-            "button[aria-label='Close ad']",
-            "button[aria-label='Close']",
-            "[aria-label*='Close' i]",
             "#dismiss-button",
+            ".dismiss-button",
+            ".continue-prompt-text",
+            "#close-ad-button",
             "div[id='dismiss-button']",
+            "div:has-text('Close')",
             "button:has-text('Close')",
             "button:has-text('닫기')",
-            "div[id='close-button']",
-            ".reward-close",
-            "[aria-label*='닫기']"
+            "[aria-label='Close ad']"
         ]
         for target in self.get_all_ad_targets():
             for f in target.frames:
+                # 严防误杀：绝不在主页面 frame 点击 Close，防止关掉续签门禁弹窗 (RewardedAdGate)
+                if f == target.main_frame:
+                    continue
                 for sel in close_selectors:
                     try:
                         btn = f.locator(sel).first
                         if btn.count() and btn.is_visible():
                             box = btn.bounding_box()
-                            if box and box["width"] > 8 and box["height"] > 8:
-                                log(f"🎯 视频播放完毕，检测到 Close 按钮 ({sel})，点击进入下一步！", "SUCCESS")
-                                btn.click(timeout=2000)
+                            if box and box["width"] > 6 and box["height"] > 6:
+                                log(f"🎯 视频播放完毕，检测到广告关闭按钮 ({sel})，点击进入下一步！", "SUCCESS")
+                                btn.click(force=True)
                                 return True
                     except Exception:
                         pass
@@ -738,64 +788,44 @@ class VoerRenewer:
         body_text = lambda: page.locator("body").inner_text()
 
         # 1. 检查今日续签是否已达上限
-        txt = body_text()
-        m = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", txt)
-        if m:
-            used, total = int(m.group(1)), int(m.group(2))
-            log(f"今日已续签: {used}/{total} 次")
-            if used >= total or used >= MAX_EXTENSIONS_PER_UTC_DAY:
-                log(f"服务器【{server_name or server_id}】今日续签次数已达上限 ({used}/{total})，无需重复续签", "SUCCESS")
-                return True
+        info_check = self.parse_server_state({"id": server_id, "name": server_name})
+        if info_check["ext_today"] >= MAX_EXTENSIONS_PER_UTC_DAY:
+            log(f"服务器【{server_name or server_id}】今日续签次数已达上限 ({info_check['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY})，无需重复续签", "SUCCESS")
+            return True
 
         # 2. 前置 Geo 诊断
         self.check_geo_support()
 
-        # 3. 第一步：点击详情页上的 "Extend" 按钮唤起续签弹窗
-        clicked_extend = False
-        for name in ("Extend", "Extend Now", "연장", "Watch Ads"):
-            b = page.get_by_role("button", name=name)
-            if b.count() and b.is_visible():
-                log(f"点击页面【{name}】按钮唤起续签弹窗")
-                b.first.click()
-                clicked_extend = True
-                break
+        # 3. 清理可能遮挡的通知层 (仅限 cookie 提示，不破坏 Google 广告组件)
+        try:
+            page.evaluate("() => document.querySelectorAll('.cookie-notice').forEach(e => e.remove())")
+        except Exception:
+            pass
 
-        if not clicked_extend:
-            write_probe("no_extend_btn", body_text())
-            log("未在页面中找到 'Extend' 按钮，可能当前会话不支持或该服务器无权续签", "WARN")
-            return False
+        # 4. 检查续签门禁弹窗是否已经开启
+        gate = page.locator("div[role='dialog']:has-text('Watch Ads to Extend'), div:has-text('Watch 3 rewarded ads')")
+        if not (gate.count() and gate.first.is_visible()):
+            clicked_extend = False
+            for name in ("Extend", "Extend Now", "연장"):
+                b = page.get_by_role("button", name=name)
+                if b.count() and b.first.is_visible():
+                    log(f"点击页面【{name}】按钮唤起续签弹窗")
+                    b.first.click(force=True)
+                    clicked_extend = True
+                    break
 
-        time.sleep(2)
+            time.sleep(2)
+            for name in ("Watch Ads", "광고 시청", "Confirm"):
+                b = page.get_by_role("button", name=name)
+                if b.count() and b.first.is_visible():
+                    log(f"点击弹窗确认按钮【{name}】启动广告播放器")
+                    b.first.click(force=True)
+                    break
+            time.sleep(3)
+        else:
+            log("检测到续签弹窗已处于激活状态，继续播放广告...", "INFO")
 
-        # 4. 第二步：在弹窗中点击 "Watch Ads" 确认按钮激活广告播放器
-        clicked_watch = False
-        for name in ("Watch Ads", "광고 시청", "Confirm", "Extend"):
-            b = page.get_by_role("button", name=name)
-            if b.count() and b.is_visible():
-                log(f"点击弹窗确认按钮【{name}】启动广告播放器")
-                b.first.click()
-                clicked_watch = True
-                break
-
-        time.sleep(3)
-
-        # 5. 等待续签弹窗与播放器加载
-        gate_found = False
-        for _ in range(15):
-            cur_txt = body_text()
-            if any(k in cur_txt for k in ["Watching ad", "All ads verified", "rewarded ads required", "Open ad player", "광고"]):
-                gate_found = True
-                break
-            time.sleep(1)
-
-        if not gate_found:
-            write_probe("no_gate", body_text())
-            log("广告播放器初始化加载超时", "ERROR")
-            return False
-
-        log("已成功激活广告播放器，开始观看激励广告...", "SUCCESS")
-
-        # 5. 核心观看循环（依次观看 3 个视频，播放完毕等待 Close 按钮）
+        # 5. 核心观看循环（依次观看 3 个视频，等待倒计时结束出现真正 Close 才关闭）
         current_ad = 0
         ad_start_time = time.time()
         last_progress_time = time.time()
@@ -819,6 +849,7 @@ class VoerRenewer:
                     status = flow.get("status")
                     req_ads = flow.get("adsRequired", 3)
                     done_ads = flow.get("completedAds", 0)
+
                     if status == "completed" or (done_ads >= req_ads and req_ads > 0):
                         log(f"🎉 服务端实时确认：3 个续签广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
                         time.sleep(2)
@@ -832,10 +863,10 @@ class VoerRenewer:
                                         const headers = {{ "Content-Type": "application/json" }};
                                         if (token) headers["Authorization"] = `Bearer ${{token}}`;
                                         await fetch('/api/servers/{server_id}/extension-ad-complete', {{
-                                            method: 'POST',
-                                            headers: headers,
-                                            body: JSON.stringify({{ flowId: fid }}),
-                                            credentials: 'include'
+                                             method: 'POST',
+                                             headers: headers,
+                                             body: JSON.stringify({{ flowId: fid }}),
+                                             credentials: 'include'
                                         }});
                                     }} catch(e) {{}}
                                 }}""", flow_id)
@@ -871,22 +902,22 @@ class VoerRenewer:
                         current_ad = done_ads
                         ad_start_time = time.time()
                         last_progress_time = time.time()
-                        log(f"🎬 服务端实时同步进度：已成功完成 {done_ads}/{req_ads} 个广告", "INFO")
+                        log(f"🎬 服务端实时同步进度：已成功完成 {done_ads}/{req_ads} 个广告，准备下一个广告...", "SUCCESS")
             except Exception as e:
                 pass
 
             # 方式 B：通过页面文本关键词检测
             if any(k in txt for k in [TXT_ALL_VERIFIED, "All ads verified", "Session extended", "연장 완료", "세션 연장"]):
                 log("🎉 页面显示广告已全部验证通过，正在自动结算使用时间...", "SUCCESS")
-                time.sleep(5)
+                time.sleep(4)
                 page.goto(url, wait_until="domcontentloaded")
                 time.sleep(3)
-                m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
-                log(f"续签完成！当前今日已续签: {m3.group(0) if m3 else '?'} (+4小时使用时间)", "SUCCESS")
+                info = self.parse_server_state({"id": server_id, "name": server_name})
+                log(f"续签完成！当前今日已续签: {info['ext_today']}/4 次 (+4小时使用时间)", "SUCCESS")
                 send_notification(
                     self.cfg,
                     f"🎉 Voer.host 续签成功: {server_name or server_id}",
-                    f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: {m3.group(0) if m3 else '已更新'}"
+                    f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: 剩余 {info['readable_time']}"
                 )
                 return True
 
@@ -900,15 +931,6 @@ class VoerRenewer:
                     last_progress_time = time.time()
                     log(f"🎬 开始播放第 {cur}/{total} 个广告，正在等待视频播放倒计时...", "INFO")
 
-            # 检查是否有独立播放器弹窗降级按钮
-            try:
-                open_p_btn = page.get_by_role("button", name=TXT_OPEN_PLAYER)
-                if open_p_btn.count() and open_p_btn.is_visible():
-                    log("内嵌播放器降级，点击 'Open ad player' 唤起独立窗口...", "INFO")
-                    open_p_btn.click(timeout=2000)
-            except Exception:
-                pass
-
             # 进度被重置提示
             if "watch all 3 ads again" in txt.lower() or TXT_PROGRESS_RESET in txt:
                 log("广告进度被重置，重新开始播放...", "WARN")
@@ -917,13 +939,13 @@ class VoerRenewer:
 
             # 核心生命周期控制：
             elapsed = time.time() - ad_start_time
-            if elapsed < 12:
-                # 视频刚开始播放的前 12 秒：专心等待视频播放，绝不点击关闭，确保奖励有效
+            if elapsed < 35:
+                # 广告刚开始播放的前 35 秒：检测并启动广告（点 Watch Ad / View a short ad），绝不点击关闭，确保奖励有效
                 self.try_start_video()
                 time.sleep(2)
                 continue
             else:
-                # 12 秒之后：视频进入尾声，开始持续探测并点击已显现的 Close 按钮
+                # 35 秒之后：广告倒计时结束，真正 Close 按钮已显现，执行关闭以触发奖励结算
                 clicked_close = self.find_and_click_close_button()
                 if clicked_close:
                     time.sleep(3)  # 点击 Close 后等待 3 秒以使后端结算并跳到下一个视频
