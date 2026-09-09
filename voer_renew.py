@@ -302,9 +302,12 @@ class VoerRenewer:
 
         proxy_opt = None
         proxy_url = self.args.proxy or self.cfg.get("proxy")
-        if proxy_url:
-            proxy_opt = {"server": proxy_url}
-            log(f"使用网络代理: {proxy_url}")
+        # 检查是否传入了有效的 storage_state
+        storage_opt = None
+        cookie_path = self.args.cookies or (self.session_file if os.path.exists(self.session_file) else None)
+        if cookie_path and os.path.exists(cookie_path):
+            storage_opt = cookie_path
+            log(f"启动时挂载 Session 文件: {cookie_path}", "INFO")
 
         ctx = pw.chromium.launch_persistent_context(
             self.profile_dir,
@@ -322,8 +325,7 @@ class VoerRenewer:
         self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self.setup_page_hooks(self.page)
 
-        # 尝试自动加载已有 Session（优先从 --cookies 或默认 session.json）
-        cookie_path = self.args.cookies or (self.session_file if os.path.exists(self.session_file) else None)
+        # 双保险：再执行一次 import_cookies 确保 cookies 和 localStorage 完全生效
         if cookie_path and os.path.exists(cookie_path):
             self.import_cookies(cookie_path)
 
@@ -340,7 +342,7 @@ class VoerRenewer:
         self.ctx.on("page", on_popup)
 
     def import_cookies(self, path: str):
-        """导入会话信息"""
+        """导入会话信息 (兼容 Playwright storage_state 格式与纯 Cookie 列表)"""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = f.read().strip()
@@ -348,20 +350,27 @@ class VoerRenewer:
                 return
             data = json.loads(raw)
             if isinstance(data, dict) and "cookies" in data:
-                self.ctx.add_cookies(data.get("cookies", []))
+                cookies = data.get("cookies", [])
+                if cookies:
+                    self.ctx.add_cookies(cookies)
                 for origin in data.get("origins", []):
-                    if origin.get("localStorage"):
-                        script = "() => {" + "".join(
-                            f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
-                            for k, v in origin["localStorage"]
-                        ) + "}"
-                        self.page.add_init_script(script)
-                log(f"已自动加载 Session 文件 ({path})，享受免密直连")
+                    items = []
+                    for item in origin.get("localStorage", []):
+                        if isinstance(item, dict):
+                            k, v = item.get("name"), item.get("value")
+                        elif isinstance(item, (list, tuple)) and len(item) == 2:
+                            k, v = item[0], item[1]
+                        else:
+                            continue
+                        items.append(f"try{{localStorage.setItem({json.dumps(k)}, {json.dumps(v)} );}}catch(e){{}}")
+                    if items:
+                        self.page.add_init_script("() => {" + "".join(items) + "}")
+                log(f"已成功加载并注入 Session ({path})，包含 {len(cookies)} 个 Cookie", "SUCCESS")
             elif isinstance(data, list):
                 self.ctx.add_cookies(data)
                 log(f"已导入 {len(data)} 个 Cookie ({path})")
         except Exception as e:
-            log(f"导入 Session 出现异常: {e}", "DEBUG")
+            log(f"导入 Session 出现异常: {e}", "WARN")
 
     def save_session(self):
         """自动保存当前登录态供下次启动零验证码秒登"""
@@ -432,12 +441,14 @@ class VoerRenewer:
             log("等待登录超时", "ERROR")
             sys.exit(4)
 
-        # 检查是否已凭 Session 直登面板
+        # 检查是否已凭 Session 直登面板（给予 SPA 异步验证充足时间）
+        log(f"正在验证 Session 是否有效，访问控制台: {PANEL_URL}...")
         page.goto(PANEL_URL, wait_until="domcontentloaded")
-        time.sleep(3)
-        if self.check_is_logged_in():
-            log(f"Session 有效，免密直接进入控制台：{page.url}", "SUCCESS")
-            return
+        for _ in range(8):
+            time.sleep(1)
+            if self.check_is_logged_in():
+                log(f"Session 验证有效！免密成功进入控制台：{page.url}", "SUCCESS")
+                return
 
         # 前往登录页
         log("Session 未生效或首次运行，打开登录页面...")

@@ -59,11 +59,24 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          # 1. 优先加载 VOER_SESSION 绕过 Turnstile
-          if [ -n "$VOER_SESSION_SECRET" ]; then
-            echo "$VOER_SESSION_SECRET" > session.json
-            echo "已成功注入 VOER_SESSION，将免验证码直连控制台！"
-          fi
+          # 1. 用 Python 安全写入 session.json 避免特殊字符被 bash 转义损坏
+          python -c "
+          import os, json
+          sess = os.environ.get('VOER_SESSION_SECRET', '').strip()
+          if sess:
+              try:
+                  data = json.loads(sess)
+                  cookie_cnt = len(data.get('cookies', []))
+                  with open('session.json', 'w', encoding='utf-8') as f:
+                      json.dump(data, f)
+                  print(f'✅ 成功解析并安全写入 session.json，包含 {cookie_cnt} 个 Cookie！')
+              except Exception as e:
+                  print(f'❌ 解析 VOER_SESSION 出现异常: {e}')
+                  with open('session.json', 'w', encoding='utf-8') as f:
+                      f.write(sess)
+          else:
+              print('⚠️ 环境变量中未检测到 VOER_SESSION_SECRET，请确认是否已添加 Secret')
+          "
 
           # 2. 如果存在完整 VOER_CONFIG，写入 config.json
           if [ -n "$VOER_CONFIG_SECRET" ]; then
