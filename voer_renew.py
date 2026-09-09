@@ -684,35 +684,47 @@ class VoerRenewer:
         # 2. 前置 Geo 诊断
         self.check_geo_support()
 
-        # 3. 点击 "Watch Ads" 或 "Extend Now" 按钮
-        clicked = False
-        for name in (TXT_WATCH_ADS, TXT_EXTEND_NOW):
+        # 3. 第一步：点击详情页上的 "Extend" 按钮唤起续签弹窗
+        clicked_extend = False
+        for name in ("Extend", "Extend Now", "연장", "Watch Ads"):
             b = page.get_by_role("button", name=name)
             if b.count() and b.is_visible():
-                log(f"点击【{name}】按钮唤起看广告弹窗")
-                b.click()
-                clicked = True
+                log(f"点击页面【{name}】按钮唤起续签弹窗")
+                b.first.click()
+                clicked_extend = True
                 break
 
-        if not clicked:
-            write_probe("no_watch_ads", body_text())
-            log("未在页面中找到 'Watch Ads' 按钮，可能当前会话不支持或该服务器无权续签", "WARN")
+        if not clicked_extend:
+            write_probe("no_extend_btn", body_text())
+            log("未在页面中找到 'Extend' 按钮，可能当前会话不支持或该服务器无权续签", "WARN")
             return False
+
+        time.sleep(2)
+
+        # 4. 第二步：在弹窗中点击 "Watch Ads" 确认按钮激活广告播放器
+        clicked_watch = False
+        for name in ("Watch Ads", "광고 시청", "Confirm", "Extend"):
+            b = page.get_by_role("button", name=name)
+            if b.count() and b.is_visible():
+                log(f"点击弹窗确认按钮【{name}】启动广告播放器")
+                b.first.click()
+                clicked_watch = True
+                break
 
         time.sleep(3)
 
-        # 4. 等待续签弹窗加载
+        # 5. 等待续签弹窗与播放器加载
         gate_found = False
         for _ in range(15):
             cur_txt = body_text()
-            if any(k in cur_txt for k in ["Watch Ads to Extend", "Extend Session", "rewarded ads required", "Open ad player"]):
+            if any(k in cur_txt for k in ["Watching ad", "All ads verified", "rewarded ads required", "Open ad player", "광고"]):
                 gate_found = True
                 break
             time.sleep(1)
 
         if not gate_found:
             write_probe("no_gate", body_text())
-            log("续签弹窗加载超时", "ERROR")
+            log("广告播放器初始化加载超时", "ERROR")
             return False
 
         log("已成功激活广告播放器，开始观看激励广告...", "SUCCESS")
