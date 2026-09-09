@@ -176,6 +176,22 @@ def load_config(cfg_path: str) -> dict:
     if os.environ.get("VOER_PROXY"):
         cfg["proxy"] = os.environ.get("VOER_PROXY")
 
+    # 自动合并环境变量中的推送凭据
+    notify = cfg.setdefault("notify", {})
+    if not isinstance(notify, dict):
+        notify = {}
+        cfg["notify"] = notify
+
+    for env_k, cfg_k in [
+        ("TG_BOT_TOKEN", "tg_bot_token"),
+        ("TG_CHAT_ID", "tg_chat_id"),
+        ("SERVERCHAN_KEY", "serverchan_key"),
+        ("PUSHPLUS_TOKEN", "pushplus_token"),
+        ("WEBHOOK_URL", "webhook_url")
+    ]:
+        if os.environ.get(env_k) and not notify.get(cfg_k):
+            notify[cfg_k] = os.environ.get(env_k)
+
     return cfg
 
 
@@ -194,59 +210,70 @@ def write_probe(tag: str, text: str):
 # ---------------------------------------------------------------------------
 def send_notification(cfg: dict, title: str, content: str):
     """支持 Telegram, Server酱, Pushplus, Discord 及通用 Webhook 推送"""
-    notify_cfg = cfg.get("notify", {})
-    if not notify_cfg:
+    notify_cfg = cfg.get("notify") or {}
+
+    tg_token = notify_cfg.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN")
+    tg_chat_id = notify_cfg.get("tg_chat_id") or os.environ.get("TG_CHAT_ID")
+    serverchan_key = notify_cfg.get("serverchan_key") or os.environ.get("SERVERCHAN_KEY")
+    pushplus_token = notify_cfg.get("pushplus_token") or os.environ.get("PUSHPLUS_TOKEN")
+    webhook_url = notify_cfg.get("webhook_url") or os.environ.get("WEBHOOK_URL")
+
+    has_any = any([tg_token and tg_chat_id, serverchan_key, pushplus_token, webhook_url])
+    if not has_any:
+        log("未检测到有效推送凭据 (可在 config.json 的 notify 节点配置 tg_bot_token/tg_chat_id 或设置环境变量)", "INFO")
         return
 
     # 1. Telegram
-    tg_token = notify_cfg.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN")
-    tg_chat_id = notify_cfg.get("tg_chat_id") or os.environ.get("TG_CHAT_ID")
     if tg_token and tg_chat_id:
         try:
             url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
             payload = json.dumps({
-                "chat_id": tg_chat_id,
+                "chat_id": str(tg_chat_id).strip(),
                 "text": f"*{title}*\n\n{content}",
                 "parse_mode": "Markdown"
             }).encode("utf-8")
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
-            log("已发送 Telegram 通知", "DEBUG")
+
+            proxy_url = cfg.get("proxy") or os.environ.get("VOER_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+            if proxy_url:
+                proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+                opener = urllib.request.build_opener(proxy_handler)
+                opener.open(req, timeout=15)
+            else:
+                urllib.request.urlopen(req, timeout=15)
+            log("🎉 Telegram 消息已成功推送！", "SUCCESS")
         except Exception as e:
             log(f"Telegram 推送失败: {e}", "WARN")
 
     # 2. Server酱 (SendKey)
-    serverchan_key = notify_cfg.get("serverchan_key") or os.environ.get("SERVERCHAN_KEY")
     if serverchan_key:
         try:
             url = f"https://sctapi.ftqq.com/{serverchan_key}.send"
             data = urllib.parse.urlencode({"title": title, "desp": content}).encode("utf-8")
             req = urllib.request.Request(url, data=data)
             urllib.request.urlopen(req, timeout=10)
-            log("已发送 Server酱 通知", "DEBUG")
+            log("🎉 Server酱 消息已成功推送！", "SUCCESS")
         except Exception as e:
             log(f"Server酱 推送失败: {e}", "WARN")
 
     # 3. PushPlus
-    pushplus_token = notify_cfg.get("pushplus_token") or os.environ.get("PUSHPLUS_TOKEN")
     if pushplus_token:
         try:
             url = "http://www.pushplus.plus/send"
             payload = json.dumps({"token": pushplus_token, "title": title, "content": content}).encode("utf-8")
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10)
-            log("已发送 PushPlus 通知", "DEBUG")
+            log("🎉 PushPlus 消息已成功推送！", "SUCCESS")
         except Exception as e:
             log(f"PushPlus 推送失败: {e}", "WARN")
 
     # 4. Webhook / Discord
-    webhook_url = notify_cfg.get("webhook_url") or os.environ.get("WEBHOOK_URL")
     if webhook_url:
         try:
             payload = json.dumps({"title": title, "content": content, "text": f"{title}\n{content}"}).encode("utf-8")
             req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10)
-            log("已发送 Webhook 通知", "DEBUG")
+            log("🎉 Webhook 消息已成功推送！", "SUCCESS")
         except Exception as e:
             log(f"Webhook 推送失败: {e}", "WARN")
 
@@ -1089,7 +1116,7 @@ def daemon_loop(renewer: VoerRenewer, args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Voer.host 看视频自动增加使用时间脚本 (深度优化版)")
-    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe", "loop", "login"])
+    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe", "loop", "login", "notify"])
     p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
                    help="配置文件路径")
     p.add_argument("--server", default=None, help="指定要续签的服务器名称或 ID")
@@ -1109,6 +1136,17 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = load_config(args.config)
+
+    # 快捷测试通知（无需启动浏览器）
+    if args.action == "notify":
+        log("正在向已配置的渠道发送测试推送消息...", "INFO")
+        send_notification(
+            cfg,
+            "🤖 Voer.host 测试推送通知",
+            f"恭喜！您的推送通知通道配置成功！\n发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n这是一条测试消息。"
+        )
+        return
+
     renewer = VoerRenewer(cfg, args)
 
     with sync_playwright() as pw:
