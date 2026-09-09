@@ -19,6 +19,17 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
+    env:
+      VOER_SESSION_SECRET: ${{ secrets.VOER_SESSION }}
+      VOER_CONFIG_SECRET: ${{ secrets.VOER_CONFIG }}
+      VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+      VOER_PASS: ${{ secrets.VOER_PASS }}
+      VOER_PROXY: ${{ secrets.VOER_PROXY }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4

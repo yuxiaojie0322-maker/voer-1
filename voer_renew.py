@@ -804,6 +804,23 @@ def run_renew(renewer: VoerRenewer, args):
             all_success = False
         time.sleep(3)
 
+    # 汇总通知：获取更新后的最新状态
+    try:
+        latest_servers = renewer.get_servers()
+        if latest_servers:
+            summary_lines = []
+            for s in latest_servers:
+                sname = s.get("name") or s.get("id")
+                ext = s.get("extensionsToday", s.get("extensions_today", 0))
+                ms_left = s.get("timeRemainingMs", s.get("timeRemaining", 0))
+                summary_lines.append(f"• *{sname}*: 剩余 {format_ms(ms_left)} (今日已续 {ext}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)")
+            
+            status_text = "全部成功 ✅" if all_success else "部分失败 ⚠️"
+            msg = f"执行结果: {status_text}\n\n当前服务器状态：\n" + "\n".join(summary_lines)
+            send_notification(renewer.cfg, "🤖 Voer.host 续签运行报告", msg)
+    except Exception as e:
+        log(f"发送汇总通知异常: {e}", "DEBUG")
+
     return all_success
 
 
