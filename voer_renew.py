@@ -736,18 +736,61 @@ class VoerRenewer:
         while time.time() - start_wait < max_duration:
             txt = body_text()
 
-            # 检测全部验证完成
-            if TXT_ALL_VERIFIED in txt or "All ads verified" in txt:
-                log("🎉 3 个视频广告已全部验证通过，正在自动结算使用时间...", "SUCCESS")
-                time.sleep(6)
-                # 刷新页面验证新状态
+            # 方式 A：直接通过底层 API 状态检测 adStartFlow 是否已完成 (completedAds >= 3)
+            try:
+                live_data = page.evaluate(f"""async () => {{
+                    try {{
+                        const r = await fetch('/api/servers/{server_id}/live', {{ credentials: 'include' }});
+                        return await r.json();
+                    }} catch(e) {{ return null; }}
+                }}""")
+                if live_data and isinstance(live_data, dict):
+                    flow = (live_data.get("live") or {}).get("adStartFlow") or {}
+                    status = flow.get("status")
+                    req_ads = flow.get("adsRequired", 3)
+                    done_ads = flow.get("completedAds", 0)
+                    if status == "completed" or (done_ads >= req_ads and req_ads > 0):
+                        log(f"🎉 服务端实时确认：3 个广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在结算...", "SUCCESS")
+                        time.sleep(4)
+                        # 尝试点击任何可能存在的完成/结算/关闭按钮
+                        for sel in ["button:has-text('Done')", "button:has-text('Claim')", "button:has-text('Close')", "button:has-text('완료')", "button:has-text('확인')"]:
+                            try:
+                                d_btn = page.locator(sel).first
+                                if d_btn.count() and d_btn.is_visible():
+                                    d_btn.click(timeout=1000)
+                            except Exception:
+                                pass
+                        time.sleep(3)
+                        # 刷新页面验证新状态
+                        page.goto(url, wait_until="domcontentloaded")
+                        time.sleep(4)
+                        m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
+                        log(f"续签大功告成！当前今日已续签: {m3.group(0) if m3 else '已更新'} (+4小时使用时间)", "SUCCESS")
+                        send_notification(
+                            self.cfg,
+                            f"🎉 Voer.host 续签成功: {server_name or server_id}",
+                            f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: {m3.group(0) if m3 else '已成功更新'}"
+                        )
+                        return True
+                    elif done_ads > 0 and done_ads != current_ad:
+                        current_ad = done_ads
+                        ad_start_time = time.time()
+                        last_progress_time = time.time()
+                        log(f"🎬 服务端实时同步进度：已成功完成 {done_ads}/{req_ads} 个广告", "INFO")
+            except Exception as e:
+                pass
+
+            # 方式 B：通过页面文本关键词检测
+            if any(k in txt for k in [TXT_ALL_VERIFIED, "All ads verified", "Session extended", "연장 완료", "세션 연장"]):
+                log("🎉 页面显示广告已全部验证通过，正在自动结算使用时间...", "SUCCESS")
+                time.sleep(5)
                 page.goto(url, wait_until="domcontentloaded")
                 time.sleep(3)
                 m3 = re.search(r"Extensions today\s*(\d+)\s*/\s*(\d+)", body_text())
                 log(f"续签完成！当前今日已续签: {m3.group(0) if m3 else '?'} (+4小时使用时间)", "SUCCESS")
                 send_notification(
                     self.cfg,
-                    f"Voer.host 续签成功: {server_name or server_id}",
+                    f"🎉 Voer.host 续签成功: {server_name or server_id}",
                     f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: {m3.group(0) if m3 else '已更新'}"
                 )
                 return True
