@@ -611,6 +611,14 @@ class VoerRenewer:
             return data.get("servers") or data.get("data") or []
         return []
 
+    def get_server(self, server_id: str) -> dict:
+        """获取指定服务器的最新详情"""
+        res = self.api_get(f"/api/servers/{server_id}")
+        body = res.get("body")
+        if isinstance(body, dict):
+            return body.get("server") or body
+        return {}
+
     def parse_server_state(self, s: dict) -> dict:
         """解析服务器的剩余时间、到期时间、今日续签次数等详细信息"""
         sid = str(s.get("id", ""))
@@ -804,65 +812,26 @@ class VoerRenewer:
                         pass
         return False
 
-    def extend_once(self, server_id: str, server_name: str = "") -> bool:
-        """执行单次续签 (+4 小时，观看 3 个视频广告)"""
+    def watch_ads_loop(self, server_id: str, server_name: str = "", purpose: str = "session_extension") -> bool:
+        """
+        核心激励广告观看通用循环 (兼容续签 session_extension 与开机 server_start)
+        依次观看 3 个视频，等待倒计时结束出现真正 Close 才关闭，防止被判作弊重置。
+        """
         page = self.page
-        url = f"{BASE_URL}/panel/server/{server_id}"
-        log(f"正在打开服务器详情页: {url}")
-        page.goto(url, wait_until="domcontentloaded")
-        time.sleep(3)
-
         body_text = lambda: page.locator("body").inner_text()
-
-        # 1. 检查今日续签是否已达上限
-        info_check = self.parse_server_state({"id": server_id, "name": server_name})
-        if info_check["ext_today"] >= MAX_EXTENSIONS_PER_UTC_DAY:
-            log(f"服务器【{server_name or server_id}】今日续签次数已达上限 ({info_check['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY})，无需重复续签", "SUCCESS")
-            return True
-
-        # 2. 前置 Geo 诊断
-        self.check_geo_support()
-
-        # 3. 清理可能遮挡的通知层 (仅限 cookie 提示，不破坏 Google 广告组件)
-        try:
-            page.evaluate("() => document.querySelectorAll('.cookie-notice').forEach(e => e.remove())")
-        except Exception:
-            pass
-
-        # 4. 检查续签门禁弹窗是否已经开启
-        gate = page.locator("div[role='dialog']:has-text('Watch Ads to Extend'), div:has-text('Watch 3 rewarded ads')")
-        if not (gate.count() and gate.first.is_visible()):
-            clicked_extend = False
-            for name in ("Extend", "Extend Now", "연장"):
-                b = page.get_by_role("button", name=name)
-                if b.count() and b.first.is_visible():
-                    log(f"点击页面【{name}】按钮唤起续签弹窗")
-                    b.first.click(force=True)
-                    clicked_extend = True
-                    break
-
-            time.sleep(2)
-            for name in ("Watch Ads", "광고 시청", "Confirm"):
-                b = page.get_by_role("button", name=name)
-                if b.count() and b.first.is_visible():
-                    log(f"点击弹窗确认按钮【{name}】启动广告播放器")
-                    b.first.click(force=True)
-                    break
-            time.sleep(3)
-        else:
-            log("检测到续签弹窗已处于激活状态，继续播放广告...", "INFO")
-
-        # 5. 核心观看循环（依次观看 3 个视频，等待倒计时结束出现真正 Close 才关闭）
         current_ad = 0
         ad_start_time = time.time()
         last_progress_time = time.time()
         start_wait = time.time()
         max_duration = self.timeout_min * 60
+        is_start = (purpose == "server_start")
+        flow_name = "开机" if is_start else "续签"
+        complete_endpoint = f"/api/servers/{server_id}/ad-start-complete" if is_start else f"/api/servers/{server_id}/extension-ad-complete"
 
         while time.time() - start_wait < max_duration:
             txt = body_text()
 
-            # 方式 A：直接通过底层 API 状态检测 sessionExtensionFlow 是否已完成 (completedAds >= 3)
+            # 方式 A：直接通过底层 API 状态检测相应 Flow 是否已完成 (completedAds >= 3)
             try:
                 srv_data = page.evaluate(f"""async () => {{
                     try {{
@@ -872,15 +841,17 @@ class VoerRenewer:
                 }}""")
                 if srv_data and isinstance(srv_data, dict):
                     server_obj = srv_data.get("server") or srv_data
-                    flow = server_obj.get("sessionExtensionFlow") or {}
+                    if is_start:
+                        flow = (server_obj.get("live") or {}).get("adStartFlow") or server_obj.get("adStartFlow") or {}
+                    else:
+                        flow = server_obj.get("sessionExtensionFlow") or {}
                     status = flow.get("status")
                     req_ads = flow.get("adsRequired", 3)
                     done_ads = flow.get("completedAds", 0)
 
                     if status == "completed" or (done_ads >= req_ads and req_ads > 0):
-                        log(f"🎉 服务端实时确认：3 个续签广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
+                        log(f"🎉 服务端实时确认：3 个{flow_name}广告已全部观看验证通过 (completedAds: {done_ads}/{req_ads})！正在提交最终结算...", "SUCCESS")
                         time.sleep(2)
-                        # 显式调用 Voer 后端完成 session extension 结算接口
                         flow_id = flow.get("flowId")
                         if flow_id:
                             try:
@@ -889,7 +860,7 @@ class VoerRenewer:
                                         const token = localStorage.getItem("token") || "";
                                         const headers = {{ "Content-Type": "application/json" }};
                                         if (token) headers["Authorization"] = `Bearer ${{token}}`;
-                                        await fetch('/api/servers/{server_id}/extension-ad-complete', {{
+                                        await fetch('{complete_endpoint}', {{
                                              method: 'POST',
                                              headers: headers,
                                              body: JSON.stringify({{ flowId: fid }}),
@@ -909,43 +880,19 @@ class VoerRenewer:
                             except Exception:
                                 pass
                         time.sleep(3)
-                        # 刷新页面验证新状态
-                        page.goto(url, wait_until="domcontentloaded")
-                        time.sleep(4)
-
-                        # 解析服务器最新状态
-                        info = self.parse_server_state({"id": server_id, "name": server_name})
-                        m3 = re.search(r"Extensions today\s*(\d+\s*/\s*\d+)", body_text())
-                        ext_disp = re.sub(r"\s+", "", m3.group(1)) if m3 else f"{info['ext_today']}/4"
-
-                        log(f"续签大功告成！当前状态: 剩余 {info['readable_time']} (今日已续签 {ext_disp} 次)", "SUCCESS")
-                        send_notification(
-                            self.cfg,
-                            f"🎉 Voer.host 续签成功: {info['name']}",
-                            f"服务器: {info['name']}\n进度: +4 小时使用时间\n剩余使用时间: {info['readable_time']}\n今日已续签: {ext_disp} 次"
-                        )
                         return True
                     elif done_ads > 0 and done_ads != current_ad:
                         current_ad = done_ads
                         ad_start_time = time.time()
                         last_progress_time = time.time()
                         log(f"🎬 服务端实时同步进度：已成功完成 {done_ads}/{req_ads} 个广告，准备下一个广告...", "SUCCESS")
-            except Exception as e:
+            except Exception:
                 pass
 
             # 方式 B：通过页面文本关键词检测
             if any(k in txt for k in [TXT_ALL_VERIFIED, "All ads verified", "Session extended", "연장 완료", "세션 연장"]):
-                log("🎉 页面显示广告已全部验证通过，正在自动结算使用时间...", "SUCCESS")
-                time.sleep(4)
-                page.goto(url, wait_until="domcontentloaded")
+                log(f"🎉 页面显示广告已全部验证通过，正在自动结算...", "SUCCESS")
                 time.sleep(3)
-                info = self.parse_server_state({"id": server_id, "name": server_name})
-                log(f"续签完成！当前今日已续签: {info['ext_today']}/4 次 (+4小时使用时间)", "SUCCESS")
-                send_notification(
-                    self.cfg,
-                    f"🎉 Voer.host 续签成功: {server_name or server_id}",
-                    f"服务器: {server_name or server_id}\n进度: +4 小时使用时间\n状态: 剩余 {info['readable_time']}"
-                )
                 return True
 
             # 匹配当前广告进度 (1 of 3, 2 of 3, 3 of 3)
@@ -993,8 +940,173 @@ class VoerRenewer:
 
             time.sleep(2)
 
-        write_probe("extend_timeout", body_text())
-        log("单次看广告超时未完成，常见原因为当前代理 IP 缺乏广告库存或网络断流", "ERROR")
+        write_probe(f"{purpose}_timeout", body_text())
+        log(f"单次看广告超时未完成，常见原因为当前代理 IP 缺乏广告库存或网络断流", "ERROR")
+        return False
+
+    def extend_once(self, server_id: str, server_name: str = "") -> bool:
+        """执行单次续签 (+4 小时，观看 3 个视频广告)"""
+        page = self.page
+        url = f"{BASE_URL}/panel/server/{server_id}"
+        log(f"正在打开服务器详情页: {url}")
+        page.goto(url, wait_until="domcontentloaded")
+        time.sleep(3)
+
+        # 1. 检查今日续签是否已达上限
+        info_check = self.parse_server_state({"id": server_id, "name": server_name})
+        if info_check["ext_today"] >= MAX_EXTENSIONS_PER_UTC_DAY:
+            log(f"服务器【{server_name or server_id}】今日续签次数已达上限 ({info_check['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY})，无需重复续签", "SUCCESS")
+            return True
+
+        # 2. 前置 Geo 诊断
+        self.check_geo_support()
+
+        # 3. 清理可能遮挡的通知层 (仅限 cookie 提示，不破坏 Google 广告组件)
+        try:
+            page.evaluate("() => document.querySelectorAll('.cookie-notice').forEach(e => e.remove())")
+        except Exception:
+            pass
+
+        # 4. 检查续签门禁弹窗是否已经开启
+        gate = page.locator("div[role='dialog']:has-text('Watch Ads to Extend'), div:has-text('Watch 3 rewarded ads')")
+        if not (gate.count() and gate.first.is_visible()):
+            for name in ("Extend", "Extend Now", "연장"):
+                b = page.get_by_role("button", name=name)
+                if b.count() and b.first.is_visible():
+                    log(f"点击页面【{name}】按钮唤起续签弹窗")
+                    b.first.click(force=True)
+                    break
+
+            time.sleep(2)
+            for name in ("Watch Ads", "광고 시청", "Confirm"):
+                b = page.get_by_role("button", name=name)
+                if b.count() and b.first.is_visible():
+                    log(f"点击弹窗确认按钮【{name}】启动广告播放器")
+                    b.first.click(force=True)
+                    break
+            time.sleep(3)
+        else:
+            log("检测到续签弹窗已处于激活状态，继续播放广告...", "INFO")
+
+        # 5. 执行广告播放循环
+        ok = self.watch_ads_loop(server_id, server_name, purpose="session_extension")
+        if not ok:
+            return False
+
+        # 刷新页面验证新状态
+        page.goto(url, wait_until="domcontentloaded")
+        time.sleep(4)
+        info = self.parse_server_state({"id": server_id, "name": server_name})
+        log(f"续签大功告成！当前状态: 剩余 {info['readable_time']} (今日已续签 {info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)", "SUCCESS")
+        send_notification(
+            self.cfg,
+            f"🎉 Voer.host 续签成功: {info['name']}",
+            f"服务器: {info['name']}\n进度: +4 小时使用时间\n剩余使用时间: {info['readable_time']}\n今日已续签: {info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY} 次"
+        )
+        return True
+
+    def start_server(self, server_id: str, server_name: str = "") -> bool:
+        """检测关机状态并自动开机 (若处于关机/离线状态，点击 Start，若需要观看开机广告则全自动观看 3 个视频以启动)"""
+        page = self.page
+        info = self.parse_server_state({"id": server_id, "name": server_name})
+        cur_status = info.get("status", "")
+        if cur_status in ["running", "online"]:
+            log(f"服务器【{server_name or server_id}】当前已处于运行状态 ({cur_status})，无需开机。", "INFO")
+            return True
+
+        url = f"{BASE_URL}/panel/server/{server_id}"
+        log(f"正在打开服务器页面执行自动开机: {url}")
+        page.goto(url, wait_until="domcontentloaded")
+        time.sleep(3)
+
+        self.check_geo_support()
+
+        # 清理通知层
+        try:
+            page.evaluate("() => document.querySelectorAll('.cookie-notice').forEach(e => e.remove())")
+        except Exception:
+            pass
+
+        # 尝试点击页面开机按钮 (Start / Start server / Recover)
+        clicked_start = False
+        for sel in [
+            "button:has-text('Start server')",
+            "button:has-text('Start Server')",
+            "button:has-text('Start')",
+            "button:has-text('Recover')",
+            "button:has-text('시작')"
+        ]:
+            try:
+                b = page.locator(sel).first
+                if b.count() and b.is_visible():
+                    btn_text = b.inner_text().strip()
+                    log(f"找到开机按钮【{btn_text}】，点击启动服务器...", "SUCCESS")
+                    b.click(force=True)
+                    clicked_start = True
+                    break
+            except Exception:
+                pass
+
+        if not clicked_start:
+            log("页面未找到常规可见开机按钮，尝试通过底层 API 请求开机...", "WARN")
+            try:
+                page.evaluate(f"""async () => {{
+                    try {{
+                        const token = localStorage.getItem("token") || "";
+                        const headers = {{ "Content-Type": "application/json" }};
+                        if (token) headers["Authorization"] = `Bearer ${{token}}`;
+                        await fetch('/api/servers/{server_id}/start', {{
+                            method: 'POST',
+                            headers: headers,
+                            body: JSON.stringify({{ adsCompleted: 0 }}),
+                            credentials: 'include'
+                        }});
+                    }} catch(e) {{}}
+                }}""")
+            except Exception:
+                pass
+
+        time.sleep(3)
+
+        # 检查是否弹出了开机看广告门禁 (Watch 3 ads to start your free server)
+        gate = page.locator("div[role='dialog']:has-text('start your free server'), div:has-text('Watch 3 ads to start'), div:has-text('Provisioning begins after verified Ad 1')")
+        if gate.count() and gate.first.is_visible():
+            log("检测到开机激励广告门禁 (需观看 3 个视频以启动免费服务器)，启动自动看广告流程...", "INFO")
+            # 尝试点击开机弹窗内的确认按钮
+            for name in ("Watch Ads", "광고 시청", "Confirm", "Start"):
+                try:
+                    b = gate.locator(f"button:has-text('{name}')").first
+                    if b.count() and b.is_visible():
+                        b.click(force=True)
+                        break
+                except Exception:
+                    pass
+            time.sleep(2)
+
+            ok = self.watch_ads_loop(server_id, server_name, purpose="server_start")
+            if not ok:
+                log("开机激励广告观看失败或超时！", "ERROR")
+                return False
+
+        # 轮询等待服务器进入 running / online 状态 (最多等待 3 分钟)
+        log(f"正在等待服务器【{server_name or server_id}】完成部署与初始化启动...")
+        start_wait = time.time()
+        while time.time() - start_wait < 180:
+            srv = self.get_server(server_id)
+            st = srv.get("status")
+            if st in ["running", "online"]:
+                log(f"🎉 服务器【{server_name or server_id}】已成功启动并正常运行 (status: {st})！", "SUCCESS")
+                send_notification(
+                    self.cfg,
+                    f"🚀 Voer.host 自动开机成功: {server_name or server_id}",
+                    f"服务器: {server_name or server_id}\n状态: 运行中 ({st})\n说明: 检测到关机状态，已自动看广告成功开机并启动新会话！"
+                )
+                return True
+            elif st in ["provisioning", "starting", "recovering"]:
+                log(f"服务器正在部署初始化中 (status: {st})，请稍候...", "INFO")
+            time.sleep(5)
+
+        log("等待服务器进入运行状态超时，请检查控制台或日志", "WARN")
         return False
 
 
@@ -1029,10 +1141,32 @@ def run_renew(renewer: VoerRenewer, args):
     for s in targets:
         sid = str(s.get("id"))
         sname = s.get("name") or sid
-        log(f"\n>>> 开始为服务器【{sname}】(ID: {sid}) 执行看视频续签...")
-        ok = renewer.extend_once(sid, sname)
-        if not ok:
-            all_success = False
+        log(f"\n>>> 检查服务器【{sname}】(ID: {sid}) 状态...")
+
+        # 1. 关机检测与自动开机
+        info = renewer.parse_server_state(s)
+        cur_status = info.get("status", "")
+        if cur_status not in ["running", "online", "provisioning", "starting"]:
+            log(f"检测到服务器【{sname}】当前处于关机/离线状态 ({cur_status})，正在执行自动开机...", "WARN")
+            started = renewer.start_server(sid, sname)
+            if started:
+                time.sleep(4)
+                latest = renewer.get_server(sid)
+                if latest:
+                    s.update(latest)
+            else:
+                all_success = False
+                continue
+
+        # 2. 若服务器已在运行且今日续签次数未满，执行续签
+        info = renewer.parse_server_state(s)
+        if info["ext_today"] < MAX_EXTENSIONS_PER_UTC_DAY:
+            log(f">>> 开始为服务器【{sname}】执行看视频续签...")
+            ok = renewer.extend_once(sid, sname)
+            if not ok:
+                all_success = False
+        else:
+            log(f"服务器【{sname}】今日续签已满额 ({info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY})，当前运行良好 (剩余 {info['readable_time']})", "SUCCESS")
         time.sleep(3)
 
     # 汇总通知：获取更新后的最新状态
@@ -1042,11 +1176,11 @@ def run_renew(renewer: VoerRenewer, args):
             summary_lines = []
             for s in latest_servers:
                 info = renewer.parse_server_state(s)
-                summary_lines.append(f"• *{info['name']}*: 剩余 {info['readable_time']} (今日已续 {info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)")
+                summary_lines.append(f"• *{info['name']}*: 状态 [{info['status']}], 剩余 {info['readable_time']} (今日已续 {info['ext_today']}/{MAX_EXTENSIONS_PER_UTC_DAY} 次)")
             
-            status_text = "全部成功 ✅" if all_success else "部分失败 ⚠️"
+            status_text = "全部完成 ✅" if all_success else "部分失败 ⚠️"
             msg = f"执行结果: {status_text}\n\n当前服务器状态：\n" + "\n".join(summary_lines)
-            send_notification(renewer.cfg, "🤖 Voer.host 续签运行报告", msg)
+            send_notification(renewer.cfg, "🤖 Voer.host 服务器运行报告", msg)
     except Exception as e:
         log(f"发送汇总通知异常: {e}", "DEBUG")
 
@@ -1056,9 +1190,11 @@ def run_renew(renewer: VoerRenewer, args):
 def daemon_loop(renewer: VoerRenewer, args):
     """
     无人值守守护挂机模式：
-    自动监测使用时间，在需要续签时看视频增加时间；达到当日 4 次上限后自动休眠等待至次日 UTC 0 点重置。
+    1. 自动检测关机状态：检测到 stopped/offline 立即全自动看激励广告开机，开启新会话；
+    2. 自动监测使用时间：剩余时间不足且续签未满 4 次时，看视频续签 (+4小时/次)；
+    3. 突破单日续签上限：今日 4 次续满后保持智能巡检，一旦运行结束关机立即自动开机，实现 7x24 小时全自动在线！
     """
-    log("已进入【无人值守守护模式】，脚本将 7x24 小时保持运行并自动管理服务器使用时间...", "SUCCESS")
+    log("已进入【无人值守守护模式】，脚本将 7x24 小时全自动监测服务器状态、自动开机与按需续签...", "SUCCESS")
 
     while True:
         try:
@@ -1078,27 +1214,51 @@ def daemon_loop(renewer: VoerRenewer, args):
                 sec_left = info["sec_left"]
                 sid = info["id"]
                 sname = info["name"]
+                status = info["status"]
                 readable_time = info["readable_time"]
 
+                # 1. 关机状态检测并自动开机
+                if status not in ["running", "online", "provisioning", "starting"]:
+                    log(f"⚠️ 巡检发现服务器【{sname}】当前处于关机/离线状态 ({status})，立即执行自动开机！", "WARN")
+                    renewer.start_server(sid, sname)
+                    time.sleep(5)
+                    latest = renewer.get_server(sid)
+                    if latest:
+                        info = renewer.parse_server_state(latest)
+                        status = info["status"]
+                        sec_left = info["sec_left"]
+                        ext_today = info["ext_today"]
+                        readable_time = info["readable_time"]
+
+                # 2. 正常运行中，若剩余时间不足且今日续签未满，执行续签
                 if ext_today < MAX_EXTENSIONS_PER_UTC_DAY:
                     all_day_full = False
-                    # 如果剩余时间小于 3.5 小时，或者剩余时间不足，立即续签
-                    if sec_left < 3.5 * 3600:
+                    if sec_left < 3.5 * 3600 and status in ["running", "online"]:
                         log(f"服务器【{sname}】剩余时间不足 ({readable_time})，今日已续 {ext_today}/4 次，立即启动看视频续签！")
                         renewer.extend_once(sid, sname)
                     else:
-                        log(f"服务器【{sname}】剩余时间充足 ({readable_time})，暂无需续签。")
-                        min_remaining_s = min(min_remaining_s, sec_left - int(3 * 3600))
+                        if status in ["running", "online"]:
+                            log(f"服务器【{sname}】剩余时间充足 ({readable_time})，暂无需续签。")
+                            min_remaining_s = min(min_remaining_s, sec_left - int(3 * 3600))
                 else:
                     log(f"服务器【{sname}】今日 4 次续签名额已全部用满（已延长 16 小时）。")
+                    if sec_left > 0:
+                        min_remaining_s = min(min_remaining_s, sec_left)
 
             if all_day_full:
-                # 计算距离下一个 UTC 00:05 的秒数
+                # 今日 4 次续签已用满，但服务器在剩余时间耗尽后会关机。
+                # 设定休眠至剩余时间或最多 30 分钟轮询一次，一旦关机立即自动开机！
                 now = datetime.now(timezone.utc)
                 seconds_until_utc_midnight = (24 * 3600) - (now.hour * 3600 + now.minute * 60 + now.second) + 300
-                hours_wait = round(seconds_until_utc_midnight / 3600, 1)
-                log(f"账号下所有服务器今日续签已满额！脚本进入休眠，将于次日 UTC 重置后唤醒（约 {hours_wait} 小时后）", "SUCCESS")
-                time.sleep(seconds_until_utc_midnight)
+
+                if min_remaining_s <= 60:
+                    log("检测到服务器会话已结束或即将关机，立即巡检执行自动开机...", "INFO")
+                    time.sleep(15)
+                    continue
+
+                sleep_sec = min(seconds_until_utc_midnight, max(900, min(min_remaining_s, 1800)))
+                log(f"今日续签名额已满，服务器正在运行 (剩余约 {min_remaining_s // 60} 分钟)。休眠 {sleep_sec // 60} 分钟后继续巡检关机状态...", "INFO")
+                time.sleep(sleep_sec)
                 continue
 
             # 决定下一次休眠时间（最短 15 分钟，最长 3 小时）
@@ -1116,19 +1276,19 @@ def daemon_loop(renewer: VoerRenewer, args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Voer.host 看视频自动增加使用时间脚本 (深度优化版)")
-    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe", "loop", "login", "notify"])
+    p.add_argument("action", nargs="?", default="run", choices=["run", "status", "probe", "loop", "login", "notify", "start"])
     p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
                    help="配置文件路径")
-    p.add_argument("--server", default=None, help="指定要续签的服务器名称或 ID")
-    p.add_argument("--all", action="store_true", help="一键为账号下所有服务器执行续签")
-    p.add_argument("--loop", action="store_true", help="开启无人值守守护模式（7x24小时全自动续签挂机）")
+    p.add_argument("--server", default=None, help="指定要续签或开机的服务器名称或 ID")
+    p.add_argument("--all", action="store_true", help="一键为账号下所有服务器执行操作")
+    p.add_argument("--loop", action="store_true", help="开启无人值守守护模式（7x24小时全自动开机与续签挂机）")
     p.add_argument("--profile-dir", default=None, help="Chromium 用户数据持久化目录")
     p.add_argument("--session-file", default=None, help="会话持久化存储文件 (默认 session.json)")
     p.add_argument("--cookies", default=None, help="自定义导入 cookie / session 路径")
     p.add_argument("--proxy", default=None, help="代理地址 (例如 http://127.0.0.1:7890)")
     p.add_argument("--cdp", default=None, help="直连已打开的真实 Chrome 端口 (例如 http://127.0.0.1:9222)")
     p.add_argument("--headless", action="store_true", help="无头模式运行")
-    p.add_argument("--timeout-min", default=10, help="单次续签超时时间（分钟）")
+    p.add_argument("--timeout-min", default=10, help="单次看广告超时时间（分钟）")
     p.add_argument("--debug", action="store_true", help="调试模式：保留浏览器窗口")
     return p.parse_args()
 
@@ -1186,6 +1346,25 @@ def main():
 
             if args.action == "status":
                 renewer.print_status()
+                return
+
+            if args.action == "start":
+                servers = renewer.get_servers()
+                if not servers:
+                    log("未找到可用服务器", "ERROR")
+                    return
+                targets = servers if args.all else [servers[0]]
+                if args.server:
+                    targets = []
+                    for s in servers:
+                        name = s.get("name") or ""
+                        if args.server.lower() in name.lower() or str(s.get("id")) == str(args.server):
+                            targets.append(s)
+                            break
+                for s in targets:
+                    sid = str(s.get("id"))
+                    sname = s.get("name") or sid
+                    renewer.start_server(sid, sname)
                 return
 
             if args.action == "probe":
