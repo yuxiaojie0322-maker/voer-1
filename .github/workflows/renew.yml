@@ -15,6 +15,13 @@ on:
         description: '单次续签超时时间(分钟)'
         required: false
         default: '12'
+  repository_dispatch:
+    types: [tunnel_down]
+
+# 授予清理历史记录所需的 API 写入权限
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   renew:
@@ -118,3 +125,12 @@ jobs:
             *.png
             renew.log
           retention-days: 3
+
+      - name: 清理历史运行记录（只保留当前最新 1 条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_minimum_runs: 1
+          delete_workflow_pattern: renew.yml
