@@ -126,11 +126,11 @@ jobs:
             renew.log
           retention-days: 3
 
-      - name: 清理历史运行记录（只保留当前最新 1 条）
+      - name: 清理历史运行记录（只保留最新 2 条）
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_minimum_runs: 1
-          delete_workflow_pattern: renew.yml
+          retain_days: 0
+          keep_minimum_runs: 2
