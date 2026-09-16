@@ -32,7 +32,6 @@ jobs:
       VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
       VOER_PASS: ${{ secrets.VOER_PASS }}
       VOER_PROXY: ${{ secrets.VOER_PROXY }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME }}
       SERVER_NAME: ${{ secrets.SERVER_NAME }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -65,6 +64,7 @@ jobs:
           VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
           VOER_PASS: ${{ secrets.VOER_PASS }}
           VOER_PROXY: ${{ secrets.VOER_PROXY }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
