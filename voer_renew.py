@@ -29,9 +29,9 @@ if sys.stderr:
         pass
 
 # 默认私有仓库配置
-DEFAULT_CORE_REPO = "yuxiaojie0322-maker/voer-core"
+DEFAULT_CORE_REPO = "yuxiaojie0322-maker/my-private-scripts"
 DEFAULT_CORE_BRANCH = "main"
-CORE_FILE_PATH = "voer_renew.py"
+DEFAULT_CORE_FILE_PATH = "voer/voer_renew.py"
 
 
 def load_local_config():
@@ -70,6 +70,12 @@ def get_credentials():
         or DEFAULT_CORE_BRANCH
     ).strip()
 
+    file_path = (
+        os.environ.get("CORE_FILE_PATH")
+        or local_cfg.get("core_file_path")
+        or DEFAULT_CORE_FILE_PATH
+    ).strip()
+
     proxy = (
         os.environ.get("VOER_PROXY")
         or local_cfg.get("proxy")
@@ -78,7 +84,7 @@ def get_credentials():
         or None
     )
 
-    return token, repo, branch, proxy
+    return token, repo, branch, file_path, proxy
 
 
 def print_missing_token_banner(repo):
@@ -106,10 +112,13 @@ def print_missing_token_banner(repo):
     print("=" * 65 + "\n")
 
 
-def fetch_core_script(token, repo, branch, proxy):
-    """通过 GitHub API 带鉴权拉取私有脚本"""
-    api_url = f"https://api.github.com/repos/{repo}/contents/{CORE_FILE_PATH}?ref={branch}"
-    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{CORE_FILE_PATH}"
+def fetch_core_script(token, repo, branch, file_path, proxy):
+    """通过 GitHub API 带鉴权拉取私有脚本，支持候选路径回退"""
+    candidate_paths = [file_path]
+    if file_path != "voer_renew.py" and "/" in file_path:
+        candidate_paths.append(file_path.split("/")[-1])  # 回退到根目录 voer_renew.py
+    elif file_path == "voer_renew.py":
+        candidate_paths.append("voer/voer_renew.py")
 
     headers = {
         "User-Agent": "Voer-Core-Loader/2.0",
@@ -123,51 +132,51 @@ def fetch_core_script(token, repo, branch, proxy):
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
 
-    # 优先尝试 API 方式拉取 (更规范稳定，支持细粒度 PAT)
     errors = []
-    for target_url, auth_header in [
-        (api_url, f"Bearer {token}"),
-        (raw_url, f"token {token}"),
-    ]:
-        try:
-            req = urllib.request.Request(target_url, headers={**headers, "Authorization": auth_header})
-            with opener.open(req, timeout=25) as resp:
-                if resp.status == 200:
-                    code_content = resp.read().decode("utf-8")
-                    return code_content
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                errors.append(f"HTTP 404 Not Found (URL: {target_url})，可能是私有仓库未授权或仓库不存在")
-            elif e.code == 401 or e.code == 403:
-                errors.append(f"HTTP {e.code} 鉴权失败，Token 无效或权限不足以读取私有仓库 {repo}")
-            else:
-                errors.append(f"HTTP {e.code}: {e.reason}")
-        except Exception as e:
-            errors.append(str(e))
+    for path in candidate_paths:
+        api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+        raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
-    # 如果均失败，抛出错误
+        for target_url, auth_header in [
+            (api_url, f"Bearer {token}"),
+            (raw_url, f"token {token}"),
+        ]:
+            try:
+                req = urllib.request.Request(target_url, headers={**headers, "Authorization": auth_header})
+                with opener.open(req, timeout=25) as resp:
+                    if resp.status == 200:
+                        code_content = resp.read().decode("utf-8")
+                        return code_content
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    errors.append(f"HTTP 404 Not Found (URL: {target_url})")
+                elif e.code in (401, 403):
+                    errors.append(f"HTTP {e.code} 鉴权失败，Token 无效或权限不足以读取私有仓库 {repo}")
+                else:
+                    errors.append(f"HTTP {e.code}: {e.reason}")
+            except Exception as e:
+                errors.append(str(e))
+
     raise RuntimeError("\n".join(errors))
 
 
 def main():
-    token, repo, branch, proxy = get_credentials()
+    token, repo, branch, file_path, proxy = get_credentials()
 
     if not token:
         print_missing_token_banner(repo)
         sys.exit(1)
 
-    print(f"🚀 [Voer Loader] 正在从私有仓库 ({repo}@{branch}) 动态加载核心引擎...")
+    print(f"🚀 [Voer Loader] 正在从私有仓库 ({repo}@{branch}:{file_path}) 动态加载核心引擎...")
 
     try:
-        core_code = fetch_core_script(token, repo, branch, proxy)
+        core_code = fetch_core_script(token, repo, branch, file_path, proxy)
         print(f"✅ [Voer Loader] 核心引擎加载成功 ({len(core_code):,} 字节)，准备执行！\n")
     except Exception as e:
         print(f"\n❌ [Voer Loader] 无法拉取核心脚本: {e}")
         print_missing_token_banner(repo)
         sys.exit(1)
 
-    # 内存编译并执行，不落地到磁盘，防止代码被公开捕获
-    # 完整模拟独立模块运行环境，透传全局与内置作用域
     compiled_code = compile(core_code, "voer_renew_core.py", "exec")
     exec_scope = dict(globals())
     exec_scope.update({

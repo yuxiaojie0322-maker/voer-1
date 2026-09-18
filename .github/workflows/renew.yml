@@ -39,8 +39,9 @@ jobs:
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       CORE_SCRIPT_TOKEN: ${{ secrets.CORE_SCRIPT_TOKEN }}
-      CORE_REPO: ${{ secrets.CORE_REPO || 'yuxiaojie0322-maker/voer-core' }}
+      CORE_REPO: ${{ secrets.CORE_REPO || 'yuxiaojie0322-maker/my-private-scripts' }}
       CORE_BRANCH: ${{ secrets.CORE_BRANCH || 'main' }}
+      CORE_FILE_PATH: ${{ secrets.CORE_FILE_PATH || 'voer/voer_renew.py' }}
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
