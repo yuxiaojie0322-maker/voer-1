@@ -19,9 +19,9 @@ if "%user_token%"=="" (
     exit /b
 )
 
-set /p user_repo="请输入私有核心仓库名称 [回车默认: yuxiaojie0322-maker/voer-core]: "
+set /p user_repo="请输入私有核心仓库名称 [回车默认: yuxiaojie0322-maker/my-private-scripts]: "
 if "%user_repo%"=="" (
-    set user_repo=yuxiaojie0322-maker/voer-core
+    set user_repo=yuxiaojie0322-maker/my-private-scripts
 )
 
 echo.
