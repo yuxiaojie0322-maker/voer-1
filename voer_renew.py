@@ -31,7 +31,7 @@ if sys.stderr:
 # 默认私有仓库配置
 DEFAULT_CORE_REPO = "yuxiaojie0322-maker/my-private-scripts"
 DEFAULT_CORE_BRANCH = "main"
-DEFAULT_CORE_FILE_PATH = "voer/voer_renew.py"
+DEFAULT_CORE_FILE_PATH = "voer-core/voer_renew.py"
 
 
 def load_local_config():
@@ -113,12 +113,12 @@ def print_missing_token_banner(repo):
 
 
 def fetch_core_script(token, repo, branch, file_path, proxy):
-    """通过 GitHub API 带鉴权拉取私有脚本，支持候选路径回退"""
-    candidate_paths = [file_path]
-    if file_path != "voer_renew.py" and "/" in file_path:
-        candidate_paths.append(file_path.split("/")[-1])  # 回退到根目录 voer_renew.py
-    elif file_path == "voer_renew.py":
-        candidate_paths.append("voer/voer_renew.py")
+    """通过 GitHub API 带鉴权拉取私有脚本，支持多候选路径回退"""
+    raw_candidates = [file_path, "voer-core/voer_renew.py", "voer/voer_renew.py", "voer_renew.py"]
+    candidate_paths = []
+    for p in raw_candidates:
+        if p and p not in candidate_paths:
+            candidate_paths.append(p)
 
     headers = {
         "User-Agent": "Voer-Core-Loader/2.0",
