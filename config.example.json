@@ -4,7 +4,7 @@
   "server_name": null,
   "proxy": null,
   "core_token": "ghp_your_github_personal_access_token_here",
-  "core_repo": "yuxiaojie0322-maker/voer-core",
+  "core_repo": "yuxiaojie0322-maker/my-private-scripts",
   "notify": {
     "tg_bot_token": "",
     "tg_chat_id": "",
